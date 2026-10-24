@@ -65,7 +65,10 @@
         <span class="legend-note">Score = Street Brawl win-rate points vs a typical pick <em>of the same tier</em>, plus a bonus for items strong players and published builds rely on (marked Core).</span>
       </div>
 
-      <input id="item-search" class="search" type="search" placeholder="Type to find items: initials work (bf = Burst Fire), commas for several, + for enhanced — Enter adds them" autocomplete="off">
+      <div class="search-row">
+        <input id="item-search" class="search" type="search" placeholder="Type to find items: initials work (bf = Burst Fire), commas for several, + for enhanced — Enter adds them" autocomplete="off">
+        <button id="scan-btn" class="scan-btn" title="Read the draft offer with your camera">📷 Scan</button>
+      </div>
 
       <div id="board-view">
         <div class="board-controls">
@@ -100,6 +103,7 @@
           <li><b>Expert picks</b>: how often players at the chosen rank buy the item on this hero in normal games, and how many published in-game builds include it, each ranked within the item's tier. Items near the top of both are marked <b>Core</b> and get +1 pt (+0.5 for commonly picked items). An item only counts if it's in at least 10% as many builds as the hero's most common item, or bought in at least 2% of high-rank games, so Street Brawl-only Legendary (Tier 5) items get no expert bonus. Street Brawl itself cannot be filtered by rank.</li>
           <li>Ranked <em>win rates</em> are deliberately not used: in normal games a player's first big item (e.g. Phantom Strike on Abrams) is compared against items bought later by players who are already ahead, so core items look bad. Street Brawl drafts don't depend on souls, so its win rates are much less skewed.</li>
           <li><b>Enhanced items</b> (✦): Street Brawl sometimes offers a stronger version of an item. Normal and enhanced picks are scored separately, both against the same "typical pick of this tier" baseline, so you can compare an enhanced offer directly with normal ones. Enhanced samples are small, so each one is pulled toward "the normal version + the usual enhanced boost for its tier" unless its own data clearly says otherwise.</li>
+          <li><b>📷 Scan</b> reads the item names on the draft screen with on-device text recognition (Tesseract.js, downloaded once from jsDelivr). Photos are processed in your browser and never uploaded. A card labelled "Enhanced" is matched to the nearest item name.</li>
           <li>The <b>±</b> after a win rate is its 95% margin of error. Two numbers whose margins overlap are not clearly different.</li>
           <li><b>Valve tag</b> (★) is the game's own draft table, which marks some items as "Good" for this hero.</li>
           <li>Win rate is correlation, not causation: an item can look good partly because of who tends to pick it. A score within about ±1 pt of zero on a few thousand games is within noise.</li>
@@ -107,6 +111,18 @@
       </details>
     </section>
   </main>
+
+  <div id="scan" class="scan" hidden>
+    <div class="scan-box" role="dialog" aria-label="Scan draft offer">
+      <video id="scan-video" playsinline muted hidden></video>
+      <p id="scan-status" class="scan-status"></p>
+      <div class="scan-actions">
+        <button id="scan-capture" class="primary" hidden>Capture</button>
+        <label class="scan-file">Use a photo<input id="scan-file" type="file" accept="image/*" hidden></label>
+        <button id="scan-close">Close</button>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

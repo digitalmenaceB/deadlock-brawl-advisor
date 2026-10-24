@@ -36,6 +36,14 @@ const COMMON_BONUS = 0.5;
 const MIN_BUILD_SHARE = 0.1;  // of the hero's most common build item
 const MIN_EXPERT_PICK = 0.02; // share of the hero's high-rank games
 
+// Camera scan: on-device OCR of the item names on the draft screen.
+const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js';
+const OCR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' -!";
+const SCAN_MAX_SIDE = 1600;
+// Share of an item name's letters that must match a line of OCR text (short names need more).
+const SCAN_MIN_SIMILARITY = 0.7;
+const SCAN_MIN_SIMILARITY_SHORT = 0.8;
+
 const PREFS_KEY = 'brawl-advisor-filters';
 const UI_KEY = 'brawl-advisor-ui';
 // Offers whose scores are closer than this are reported as a toss-up.
@@ -55,6 +63,7 @@ const state = {
   boardTier: 'all',
   minGrade: 'all',
   offered: [],
+  scanNote: '',
 };
 
 const requestCache = new Map();
@@ -559,6 +568,7 @@ function renderTray() {
 
   $('tray').innerHTML = `
     <div class="verdict">${verdict}<button class="clear" data-action="clear">Clear (Esc)</button></div>
+    ${state.scanNote ? `<p class="hint">📷 ${state.scanNote}</p>` : ''}
     ${mixedNote}
     <div class="offer-list">${offered.map((o, i) => `
       <button class="offer" data-key="${o.key}" title="Remove from offer">
@@ -578,6 +588,7 @@ function toggleOffer(key) {
 
 function clearOffer() {
   state.offered = [];
+  state.scanNote = '';
   if (state.view && state.itemView === 'board') renderBoard();
 }
 
@@ -821,6 +832,204 @@ function renderHero() {
   renderAbilities();
 }
 
+// ---------- camera scan ----------
+
+const scan = { stream: null, workerPromise: null, readerReady: false, busy: false };
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error("Couldn't download the text reader. Check your connection."));
+    document.head.append(s);
+  });
+}
+
+/** Lazily loads Tesseract.js and one reusable worker, set up for scattered UI text. */
+function ocrWorker() {
+  if (!scan.workerPromise) {
+    scan.workerPromise = (async () => {
+      if (!window.Tesseract) await loadScript(TESSERACT_URL);
+      const worker = await window.Tesseract.createWorker('eng');
+      await worker.setParameters({ tessedit_pageseg_mode: '11', tessedit_char_whitelist: OCR_WHITELIST });
+      scan.readerReady = true;
+      return worker;
+    })();
+    scan.workerPromise.catch(() => { scan.workerPromise = null; });
+  }
+  return scan.workerPromise;
+}
+
+function setScanStatus(msg, isError = false) {
+  $('scan-status').textContent = msg;
+  $('scan-status').classList.toggle('error', isError);
+}
+
+function idleScanStatus() {
+  if (!scan.readerReady) setScanStatus('Preparing the text reader… (first time downloads about 10 MB)');
+  else setScanStatus(scan.stream ? 'Point at the item names on the draft screen and tap Capture.' : 'Tap "Use a photo" to scan a picture or screenshot of the draft.');
+}
+
+async function openScanner() {
+  if (!state.view) return;
+  if (state.itemView !== 'board') {
+    state.itemView = 'board';
+    renderItems();
+  }
+  $('scan').hidden = false;
+  idleScanStatus();
+  ocrWorker().then(() => { if (!scan.busy) idleScanStatus(); }, (err) => setScanStatus(err.message, true));
+
+  const video = $('scan-video');
+  // Browsers only expose the camera on https:// (or localhost) pages.
+  if (!scan.stream && navigator.mediaDevices?.getUserMedia && window.isSecureContext) {
+    try {
+      scan.stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        audio: false,
+      });
+      video.srcObject = scan.stream;
+      await video.play();
+    } catch (err) {
+      scan.stream = null;
+      setScanStatus(`Camera unavailable (${err.message}). Use a photo instead.`, true);
+    }
+  }
+  if ($('scan').hidden) return closeScanner(); // closed while the camera was starting
+  video.hidden = !scan.stream;
+  $('scan-capture').hidden = !scan.stream;
+  if (scan.stream && !scan.busy) idleScanStatus();
+}
+
+function closeScanner() {
+  $('scan').hidden = true;
+  if (scan.stream) {
+    for (const track of scan.stream.getTracks()) track.stop();
+    scan.stream = null;
+  }
+  $('scan-video').srcObject = null;
+}
+
+/** Draws the source scaled down to SCAN_MAX_SIDE and converted to greyscale, which reads better. */
+function prepareScanCanvas(source, width, height) {
+  const scale = Math.min(1, SCAN_MAX_SIDE / Math.max(width, height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(width * scale);
+  canvas.height = Math.round(height * scale);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const px = img.data;
+  for (let i = 0; i < px.length; i += 4) {
+    const y = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+    px[i] = px[i + 1] = px[i + 2] = y;
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
+function captureFrame() {
+  const video = $('scan-video');
+  if (!video.videoWidth) return;
+  runScan(prepareScanCanvas(video, video.videoWidth, video.videoHeight));
+}
+
+async function scanImageFile(file) {
+  if (!file) return;
+  try {
+    const bitmap = await createImageBitmap(file);
+    await runScan(prepareScanCanvas(bitmap, bitmap.width, bitmap.height));
+  } catch (err) {
+    setScanStatus(`Couldn't open that image (${err.message}).`, true);
+  }
+}
+
+async function runScan(canvas) {
+  if (scan.busy) return;
+  scan.busy = true;
+  $('scan-capture').disabled = true;
+  try {
+    setScanStatus(scan.readerReady ? 'Reading…' : 'Preparing the text reader, then reading…');
+    const worker = await ocrWorker();
+    const { data } = await worker.recognize(canvas, {}, { text: true, blocks: true });
+    const lines = (data.blocks || [])
+      .flatMap((b) => b.paragraphs.flatMap((p) => p.lines))
+      .map((l) => ({ text: l.text.trim(), box: l.bbox }))
+      .filter((l) => l.text);
+    const found = matchOfferLines(lines);
+    if (!found.length) {
+      const read = lines.map((l) => l.text).filter((t) => t.length > 2).join(' | ');
+      setScanStatus(`No item names recognised${read ? ` (read: "${read}")` : ''}. Get the names in frame, hold steady and try again.`, true);
+      return;
+    }
+    state.offered = found.map((f) => offerKey(f.e.id, f.enhanced));
+    state.scanNote = `Scanned: ${found.map((f) => f.e.item.name + (f.enhanced ? ' (enhanced)' : '')).join(', ')} — wrong? tap to remove, or type to add.`;
+    closeScanner();
+    renderBoard();
+  } catch (err) {
+    setScanStatus(`Scan failed: ${err.message}`, true);
+  } finally {
+    scan.busy = false;
+    $('scan-capture').disabled = false;
+  }
+}
+
+const lettersOnly = (s) => s.toLowerCase().replace(/[^a-z]/g, '');
+
+/** Edit distance between `needle` and its best-matching stretch of `hay` (hay may hold extra text). */
+function substringDistance(needle, hay) {
+  let prev = new Array(hay.length + 1).fill(0);
+  for (let i = 1; i <= needle.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= hay.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (needle[i - 1] === hay[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return Math.min(...prev);
+}
+
+/**
+ * Turns OCR lines into offered items: each line is fuzzy-matched against this hero's draft items
+ * (tolerating clipped or misread letters), and an "Enhanced" label marks the nearest item.
+ */
+function matchOfferLines(lines) {
+  const candidates = state.view.items.entries.map((e) => ({ e, letters: lettersOnly(e.item.name) }));
+  const center = (b) => ({ x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2 });
+  const found = new Map();
+  const enhancedMarks = [];
+
+  for (const line of lines) {
+    const text = lettersOnly(line.text);
+    if (text.length >= 6 && substringDistance('enhanced', text) <= 2) enhancedMarks.push(center(line.box));
+    if (text.length < 4) continue;
+
+    let best = null;
+    for (const c of candidates) {
+      if (text.length < c.letters.length * 0.6) continue;
+      const sim = 1 - substringDistance(c.letters, text) / c.letters.length;
+      if (!best || sim > best.sim) best = { e: c.e, sim };
+    }
+    const needed = best && best.e.item.name.length <= 8 ? SCAN_MIN_SIMILARITY_SHORT : SCAN_MIN_SIMILARITY;
+    if (best && best.sim >= needed && !(found.get(best.e.id)?.sim >= best.sim)) {
+      found.set(best.e.id, { e: best.e, sim: best.sim, at: center(line.box), enhanced: false });
+    }
+  }
+
+  const items = [...found.values()];
+  for (const mark of enhancedMarks) {
+    let nearest = null;
+    let nearestDist = Infinity;
+    for (const f of items) {
+      const d = Math.hypot(f.at.x - mark.x, f.at.y - mark.y);
+      if (d < nearestDist) { nearest = f; nearestDist = d; }
+    }
+    if (nearest?.e.enh) nearest.enhanced = true;
+  }
+  return items.sort((a, b) => a.at.x - b.at.x);
+}
+
 // ---------- navigation ----------
 
 async function openHero(heroId) {
@@ -959,7 +1168,19 @@ async function init() {
     const offer = ev.target.closest('.offer');
     if (offer) toggleOffer(offer.dataset.key);
   });
+  $('scan-btn').addEventListener('click', openScanner);
+  $('scan-close').addEventListener('click', closeScanner);
+  $('scan-capture').addEventListener('click', captureFrame);
+  $('scan-file').addEventListener('change', (ev) => {
+    scanImageFile(ev.target.files[0]);
+    ev.target.value = ''; // allow picking the same file again
+  });
+
   document.addEventListener('keydown', (ev) => {
+    if (!$('scan').hidden) {
+      if (ev.key === 'Escape') closeScanner();
+      return;
+    }
     if (!state.view || ev.ctrlKey || ev.metaKey || ev.altKey) return;
     if (ev.target instanceof Element && ev.target.closest('input, select, textarea')) return;
     if (state.itemView === 'board' && /^[0-9]$/.test(ev.key)) {
