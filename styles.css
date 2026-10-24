@@ -570,6 +570,15 @@ kbd {
 .about { margin-top: 28px; color: var(--muted); }
 .about summary { cursor: pointer; color: var(--text); }
 
+/* Phones in landscape: little height, so nothing stays pinned and the header is one compact row. */
+@media (max-height: 500px) {
+  .topbar { position: static; padding: 6px 16px; gap: 8px 14px; }
+  .topbar h1 .sub { display: none; }
+  .filters { gap: 10px; }
+  .filters label { flex-direction: row; align-items: center; gap: 6px; }
+  .tray { position: static; }
+}
+
 @media (max-width: 640px) {
   .topbar { position: static; }
   .tray { top: 0; }
