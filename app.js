@@ -55,6 +55,8 @@ const SCAN_ANCHOR_TEXT = '1 Re-Roll Remaining';
 const SCAN_NAME_SLOTS = [{ x: -2.72, y: -0.21 }, { x: 0.04, y: -1.77 }, { x: 2.7, y: -0.18 }];
 // Each name is cropped this size (same units) and enlarged to this many pixels tall for reading.
 const SCAN_CROP = { width: 2.6, height: 0.5, textPx: 110 };
+// The strip checked for an "ENHANCED" label under a name is enlarged to this many pixels tall.
+const SCAN_LABEL_PX = 70;
 
 const PREFS_KEY = 'brawl-advisor-filters';
 const UI_KEY = 'brawl-advisor-ui';
@@ -1089,6 +1091,26 @@ function findLayoutAnchor(lines) {
 }
 
 /**
+ * Fallback anchor when "Re-Roll Remaining" wasn't read: two names already found pin down the layout.
+ * Tries each way of assigning them to the three name positions and keeps the one that fits best.
+ */
+function inferAnchorFromItems(found) {
+  if (found.length !== 2) return null;
+  const [p, q] = found.map((f) => f.at);
+  let best = null;
+  for (const [i, j] of [[0, 1], [0, 2], [1, 0], [1, 2], [2, 0], [2, 1]]) {
+    const a = SCAN_NAME_SLOTS[i];
+    const b = SCAN_NAME_SLOTS[j];
+    const unit = Math.hypot(q.x - p.x, q.y - p.y) / Math.hypot(b.x - a.x, b.y - a.y);
+    if (!(unit > 0)) continue;
+    // How far the actual offset between the names is from the layout's, in layout units.
+    const misfit = Math.hypot((q.x - p.x) / unit - (b.x - a.x), (q.y - p.y) / unit - (b.y - a.y));
+    if (!best || misfit < best.misfit) best = { misfit, unit, x: p.x - a.x * unit, y: p.y - a.y * unit };
+  }
+  return best && best.misfit < 0.35 ? { unit: best.unit, x: best.x, y: best.y } : null;
+}
+
+/**
  * Reads each name position that has no item yet as its own single line: crops it out relative to the
  * anchor, enlarges it and OCRs it. Much more reliable than whole-photo OCR on the glowing cards.
  */
@@ -1111,12 +1133,36 @@ async function readNameSlots(worker, source, width, height, anchor, found, log) 
       const m = bestItemFor(text, false);
       log.push({ slot: i, psm, text, item: m?.e.item.name ?? null });
       if (m) {
-        items.push({ e: m.e, sim: m.sim, at: { x: cx, y: cy }, enhanced: isEnhancedLabel(text) && !!m.e.enh });
+        const nameBox = { x0: cx - 0.8 * anchor.unit, y0: cy - 0.12 * anchor.unit, x1: cx + 0.8 * anchor.unit, y1: cy + 0.12 * anchor.unit };
+        items.push({ e: m.e, sim: m.sim, at: { x: cx, y: cy }, box: nameBox, enhanced: isEnhancedLabel(text) && !!m.e.enh });
         break;
       }
     }
   }
   return items;
+}
+
+/**
+ * Enhanced picks carry an "ENHANCED" label directly under the item name. The whole-photo reads often
+ * skip that small text, so read the strip under each name that has an enhanced version.
+ */
+async function readEnhancedLabels(worker, source, width, height, found, log) {
+  for (const f of found) {
+    if (f.enhanced || !f.e.enh || !f.box) continue;
+    const h = f.box.y1 - f.box.y0;
+    const w = Math.max(f.box.x1 - f.box.x0, 5 * h);
+    const cx = (f.box.x0 + f.box.x1) / 2;
+    const x0 = Math.max(0, cx - w / 2);
+    const y0 = Math.max(0, f.box.y1 - 0.1 * h);
+    const x1 = Math.min(width, cx + w / 2);
+    const y1 = Math.min(height, f.box.y1 + 1.6 * h);
+    if (x1 - x0 < 20 || y1 - y0 < 8) continue;
+    const region = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    const scale = Math.min(4, Math.max(1, SCAN_LABEL_PX / region.h));
+    const text = (await ocrLines(worker, greyCanvas(source, region, scale, true), scale, '7', region)).map((l) => l.text).join(' ');
+    log.push({ label: f.e.item.name, text });
+    if (isEnhancedLabel(text)) f.enhanced = true;
+  }
 }
 
 function mergeFound(...lists) {
@@ -1150,7 +1196,7 @@ async function runScan(source, width, height, origin, { final = true } = {}) {
     const firstLines = await ocrLines(worker, greyCanvas(source, whole, s1, first.stretch), s1);
     let lines = firstLines;
     let found = matchOfferLines(lines);
-    let anchor = findLayoutAnchor(lines);
+    let anchor = findLayoutAnchor(lines) || inferAnchorFromItems(found);
     if (found.length < SCAN_EXPECTED && anchor) {
       found = mergeFound(found, await readNameSlots(worker, source, width, height, anchor, found, slotReads));
     }
@@ -1162,11 +1208,12 @@ async function runScan(source, width, height, origin, { final = true } = {}) {
       secondLines = await ocrLines(worker, greyCanvas(source, whole, s2, second.stretch), s2);
       lines = firstLines.concat(secondLines);
       found = mergeFound(found, matchOfferLines(lines));
-      if (found.length < SCAN_EXPECTED && !anchor && (anchor = findLayoutAnchor(secondLines))) {
+      if (found.length < SCAN_EXPECTED && !anchor && (anchor = findLayoutAnchor(secondLines) || inferAnchorFromItems(found))) {
         found = mergeFound(found, await readNameSlots(worker, source, width, height, anchor, found, slotReads));
       }
     }
     markEnhanced(found, lines);
+    await readEnhancedLabels(worker, source, width, height, found, slotReads);
     found.sort((a, b) => a.at.x - b.at.x);
 
     if (!found.length && !final) return 0;
@@ -1333,7 +1380,7 @@ async function renderScanLog() {
       .filter(([, ls]) => ls)
       .map(([label, ls]) => `${label}: ${ls.map((l) => esc(l.text)).join(' | ') || '(nothing)'}`)
       .concat(e.slotReads?.length
-        ? [`Name areas: ${e.slotReads.map((r) => `${esc(r.text) || '(nothing)'}${r.item ? ` → ${esc(r.item)}` : ''}`).join(' | ')}`]
+        ? [`Name areas: ${e.slotReads.map((r) => `${r.label ? `[under ${esc(r.label)}] ` : ''}${esc(r.text) || '(nothing)'}${r.item ? ` → ${esc(r.item)}` : ''}`).join(' | ')}`]
         : [])
       .join('\n');
     return `<div class="log-entry">
@@ -1493,7 +1540,7 @@ function matchOfferLines(lines) {
   const found = [];
   for (const c of chunks) {
     const m = bestItemFor(c.text, c.joined);
-    if (m) found.push({ e: m.e, sim: m.sim, at: center(c.box), enhanced: false });
+    if (m) found.push({ e: m.e, sim: m.sim, at: center(c.box), box: c.box, enhanced: false });
   }
   return mergeFound(found);
 }
