@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Brawl Draft Advisor</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <button id="back" class="back" hidden aria-label="Back to heroes">&larr; Heroes</button>
+    <h1>Brawl Draft Advisor <span class="sub">Deadlock Street Brawl</span></h1>
+    <div class="filters">
+      <label>Period
+        <select id="f-days">
+          <option value="7">Last 7 days</option>
+          <option value="14" selected>Last 14 days</option>
+          <option value="30">Last 30 days</option>
+        </select>
+      </label>
+      <label title="Rank floor for the 'what strong players buy' signal (Street Brawl itself cannot be filtered by rank)">Expert rank
+        <select id="f-badge">
+          <option value="0">Off (builds only)</option>
+          <option value="71">Emissary+</option>
+          <option value="81" selected>Oracle+</option>
+          <option value="91">Phantom+</option>
+          <option value="101">Ascendant+</option>
+        </select>
+      </label>
+      <label title="How the Best/Good/Mid/Bad/Avoid grade is computed">Grade by
+        <select id="f-mode">
+          <option value="expert" selected>Results + expert picks</option>
+          <option value="sb">Street Brawl results only</option>
+        </select>
+      </label>
+    </div>
+  </header>
+
+  <main>
+    <div id="status" class="status" role="status"></div>
+
+    <section id="picker">
+      <input id="hero-search" class="search" type="search" placeholder="Search heroes…" autocomplete="off">
+      <div id="hero-grid" class="hero-grid"></div>
+    </section>
+
+    <section id="hero-view" hidden>
+      <div id="hero-head" class="hero-head"></div>
+
+      <div class="item-bar">
+        <h2>Items</h2>
+        <div class="view-tabs" role="tablist">
+          <button data-view="board" role="tab">Draft board</button>
+          <button data-view="list" role="tab">Full list</button>
+        </div>
+      </div>
+
+      <div class="legend">
+        <span class="grade g-best">Best</span>
+        <span class="grade g-good">Good</span>
+        <span class="grade g-mid">Mid</span>
+        <span class="grade g-bad">Bad</span>
+        <span class="grade g-avoid">Avoid</span>
+        <span class="core-tag">Core</span>
+        <span class="legend-note">Score = Street Brawl win-rate points vs a typical pick <em>of the same tier</em>, plus a bonus for items strong players and published builds rely on (marked Core).</span>
+      </div>
+
+      <input id="item-search" class="search" type="search" placeholder="Type to find items: initials work (bf = Burst Fire), commas for several, + for enhanced — Enter adds them" autocomplete="off">
+
+      <div id="board-view">
+        <div class="board-controls">
+          <div id="tier-tabs" class="tier-tabs"></div>
+          <div id="grade-filter" class="tier-tabs grade-filter"></div>
+        </div>
+        <div id="tray" class="tray"></div>
+        <div id="board"></div>
+        <p class="hint">Tap the items you're offered to compare them — tap the <span class="enh-tag">✦</span> strip under a tile when the offer is the enhanced version. Keys: <kbd>1</kbd>–<kbd>5</kbd> tier, <kbd>0</kbd> all tiers, start typing to search (searches every tier), <kbd>Enter</kbd> add the highlighted matches, <kbd>Esc</kbd> clear.
+          Fastest: type the offers, e.g. <kbd>tm, cc, sd</kbd> (add <kbd>+</kbd> for enhanced, e.g. <kbd>sd+</kbd>), press <kbd>Enter</kbd>, then <kbd>Esc</kbd> before the next round.</p>
+      </div>
+
+      <div id="list-view" hidden>
+        <p class="hint">Click an item for the full why.</p>
+        <div id="tiers" class="tiers"></div>
+      </div>
+
+      <h2>Ability order</h2>
+      <div class="ability-controls">
+        <label><input type="radio" name="ab-mode" value="wr" checked> Highest win rate path</label>
+        <label><input type="radio" name="ab-mode" value="pop"> Most popular path</label>
+      </div>
+      <div id="abilities"></div>
+
+      <details class="about">
+        <summary>How this works</summary>
+        <ul>
+          <li>Data comes live from <a href="https://deadlock-api.com" target="_blank" rel="noopener">deadlock-api.com</a>, which aggregates recent public match data.</li>
+          <li><b>Street Brawl</b> win rates are the main signal: for each item, how often this hero won when they drafted it, compared with the hero's overall Street Brawl win rate.</li>
+          <li>Items are only compared against other items <b>of the same tier</b>, because the draft offers you choices within a tier, and later tiers only show up in longer games.</li>
+          <li>Small samples are shrunk toward average (a rarely-picked item needs a lot of evidence to score far from 0), so a grade on a "low data" item is a weak hint.</li>
+          <li><b>Expert picks</b>: how often players at the chosen rank buy the item on this hero in normal games, and how many published in-game builds include it, each ranked within the item's tier. Items near the top of both are marked <b>Core</b> and get +1 pt (+0.5 for commonly picked items). An item only counts if it's in at least 10% as many builds as the hero's most common item, or bought in at least 2% of high-rank games, so Street Brawl-only Legendary (Tier 5) items get no expert bonus. Street Brawl itself cannot be filtered by rank.</li>
+          <li>Ranked <em>win rates</em> are deliberately not used: in normal games a player's first big item (e.g. Phantom Strike on Abrams) is compared against items bought later by players who are already ahead, so core items look bad. Street Brawl drafts don't depend on souls, so its win rates are much less skewed.</li>
+          <li><b>Enhanced items</b> (✦): Street Brawl sometimes offers a stronger version of an item. Normal and enhanced picks are scored separately, both against the same "typical pick of this tier" baseline, so you can compare an enhanced offer directly with normal ones. Enhanced samples are small, so each one is pulled toward "the normal version + the usual enhanced boost for its tier" unless its own data clearly says otherwise.</li>
+          <li>The <b>±</b> after a win rate is its 95% margin of error. Two numbers whose margins overlap are not clearly different.</li>
+          <li><b>Valve tag</b> (★) is the game's own draft table, which marks some items as "Good" for this hero.</li>
+          <li>Win rate is correlation, not causation: an item can look good partly because of who tends to pick it. A score within about ±1 pt of zero on a few thousand games is within noise.</li>
+        </ul>
+      </details>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
