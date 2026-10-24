@@ -39,7 +39,11 @@ const MIN_EXPERT_PICK = 0.02; // share of the hero's high-rank games
 // Camera scan: on-device OCR of the item names on the draft screen.
 const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js';
 const OCR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' -!";
+// First read at a moderate size; if fewer than SCAN_EXPECTED items turn up, read again enlarged
+// with stretched contrast, which recovers blurry or distant names (tested on degraded photos).
 const SCAN_MAX_SIDE = 1600;
+const SCAN_SECOND_PASS_SIDE = 2400;
+const SCAN_EXPECTED = 3;
 // Share of an item name's letters that must match a line of OCR text (short names need more).
 const SCAN_MIN_SIMILARITY = 0.7;
 const SCAN_MIN_SIMILARITY_SHORT = 0.8;
@@ -868,7 +872,9 @@ function setScanStatus(msg, isError = false) {
 
 function idleScanStatus() {
   if (!scan.readerReady) setScanStatus('Preparing the text reader… (first time downloads about 10 MB)');
-  else setScanStatus(scan.stream ? 'Point at the item names on the draft screen and tap Capture.' : 'Tap "Use a photo" to scan a picture or screenshot of the draft.');
+  else setScanStatus(scan.stream
+    ? 'Get close so the item names fill the frame, avoid glare, hold steady, then tap Capture.'
+    : 'Tap "Use a photo" to scan a picture or screenshot of the draft.');
 }
 
 async function openScanner() {
@@ -886,7 +892,7 @@ async function openScanner() {
   if (!scan.stream && navigator.mediaDevices?.getUserMedia && window.isSecureContext) {
     try {
       scan.stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } },
         audio: false,
       });
       video.srcObject = scan.stream;
@@ -911,53 +917,93 @@ function closeScanner() {
   $('scan-video').srcObject = null;
 }
 
-/** Draws the source scaled down to SCAN_MAX_SIDE and converted to greyscale, which reads better. */
-function prepareScanCanvas(source, width, height) {
-  const scale = Math.min(1, SCAN_MAX_SIDE / Math.max(width, height));
+const SCAN_PASSES = [
+  { side: SCAN_MAX_SIDE, maxScale: 1, stretch: false },
+  { side: SCAN_SECOND_PASS_SIDE, maxScale: 2, stretch: true },
+];
+const scanScale = (width, height, pass) => Math.min(pass.maxScale, pass.side / Math.max(width, height));
+
+/** Draws the source scaled for this pass and in greyscale (reads better), optionally contrast-stretched. */
+function prepareScanCanvas(source, width, height, pass) {
+  const scale = scanScale(width, height, pass);
+  const { stretch } = pass;
   const canvas = document.createElement('canvas');
   canvas.width = Math.round(width * scale);
   canvas.height = Math.round(height * scale);
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
   const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const px = img.data;
+  let lo = 255;
+  let hi = 0;
   for (let i = 0; i < px.length; i += 4) {
     const y = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
     px[i] = px[i + 1] = px[i + 2] = y;
+    if (y < lo) lo = y;
+    if (y > hi) hi = y;
+  }
+  if (stretch && hi > lo) {
+    for (let i = 0; i < px.length; i += 4) px[i] = px[i + 1] = px[i + 2] = ((px[i] - lo) * 255) / (hi - lo);
   }
   ctx.putImageData(img, 0, 0);
   return canvas;
 }
 
-function captureFrame() {
+async function captureFrame() {
   const video = $('scan-video');
-  if (!video.videoWidth) return;
-  runScan(prepareScanCanvas(video, video.videoWidth, video.videoHeight));
+  if (!video.videoWidth || scan.busy) return;
+  // A still photo (Chrome on Android) is sharper and higher resolution than a video frame.
+  const track = scan.stream?.getVideoTracks()[0];
+  if (track && 'ImageCapture' in window) {
+    try {
+      const photo = await createImageBitmap(await new ImageCapture(track).takePhoto());
+      return runScan(photo, photo.width, photo.height);
+    } catch { /* fall back to the video frame */ }
+  }
+  const frame = document.createElement('canvas');
+  frame.width = video.videoWidth;
+  frame.height = video.videoHeight;
+  frame.getContext('2d').drawImage(video, 0, 0);
+  return runScan(frame, frame.width, frame.height);
 }
 
 async function scanImageFile(file) {
   if (!file) return;
   try {
     const bitmap = await createImageBitmap(file);
-    await runScan(prepareScanCanvas(bitmap, bitmap.width, bitmap.height));
+    await runScan(bitmap, bitmap.width, bitmap.height);
   } catch (err) {
     setScanStatus(`Couldn't open that image (${err.message}).`, true);
   }
 }
 
-async function runScan(canvas) {
+async function ocrLines(worker, canvas) {
+  const { data } = await worker.recognize(canvas, {}, { text: true, blocks: true });
+  return (data.blocks || [])
+    .flatMap((b) => b.paragraphs.flatMap((p) => p.lines))
+    .map((l) => ({ text: l.text.trim(), box: l.bbox }))
+    .filter((l) => l.text);
+}
+
+async function runScan(source, width, height) {
   if (scan.busy) return;
   scan.busy = true;
   $('scan-capture').disabled = true;
   try {
     setScanStatus(scan.readerReady ? 'Reading…' : 'Preparing the text reader, then reading…');
     const worker = await ocrWorker();
-    const { data } = await worker.recognize(canvas, {}, { text: true, blocks: true });
-    const lines = (data.blocks || [])
-      .flatMap((b) => b.paragraphs.flatMap((p) => p.lines))
-      .map((l) => ({ text: l.text.trim(), box: l.bbox }))
-      .filter((l) => l.text);
-    const found = matchOfferLines(lines);
+    const [first, second] = SCAN_PASSES;
+    let lines = await ocrLines(worker, prepareScanCanvas(source, width, height, first));
+    let found = matchOfferLines(lines);
+    if (found.length < SCAN_EXPECTED) {
+      setScanStatus(`Found ${found.length} — taking a closer look…`);
+      const closer = await ocrLines(worker, prepareScanCanvas(source, width, height, second));
+      // The second pass works on a larger image, so bring its boxes back to the first pass's scale.
+      const k = scanScale(width, height, first) / scanScale(width, height, second);
+      lines = lines.concat(closer.map((l) => ({ text: l.text, box: { x0: l.box.x0 * k, y0: l.box.y0 * k, x1: l.box.x1 * k, y1: l.box.y1 * k } })));
+      found = matchOfferLines(lines);
+    }
     if (!found.length) {
       const read = lines.map((l) => l.text).filter((t) => t.length > 2).join(' | ');
       setScanStatus(`No item names recognised${read ? ` (read: "${read}")` : ''}. Get the names in frame, hold steady and try again.`, true);
@@ -1000,7 +1046,24 @@ function matchOfferLines(lines) {
   const found = new Map();
   const enhancedMarks = [];
 
-  for (const line of lines) {
+  // A name can come back as two pieces side by side ("Superior" + "Duration"); try them joined too.
+  const joined = [];
+  for (const a of lines) {
+    for (const b of lines) {
+      if (a === b) continue;
+      const h = Math.max(a.box.y1 - a.box.y0, b.box.y1 - b.box.y0);
+      const dy = Math.abs((a.box.y0 + a.box.y1) / 2 - (b.box.y0 + b.box.y1) / 2);
+      const gap = b.box.x0 - a.box.x1;
+      if (dy < h * 0.6 && gap > -h * 0.5 && gap < h * 2) {
+        joined.push({
+          text: `${a.text} ${b.text}`,
+          box: { x0: a.box.x0, y0: Math.min(a.box.y0, b.box.y0), x1: b.box.x1, y1: Math.max(a.box.y1, b.box.y1) },
+        });
+      }
+    }
+  }
+
+  for (const line of [...lines, ...joined]) {
     const text = lettersOnly(line.text);
     if (text.length >= 6 && substringDistance('enhanced', text) <= 2) enhancedMarks.push(center(line.box));
     if (text.length < 4) continue;
