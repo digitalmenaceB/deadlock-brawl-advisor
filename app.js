@@ -47,6 +47,14 @@ const SCAN_EXPECTED = 3;
 // Share of an item name's letters that must match a line of OCR text (short names need more).
 const SCAN_MIN_SIMILARITY = 0.7;
 const SCAN_MIN_SIMILARITY_SHORT = 0.8;
+// Two fragments joined into one chunk can make letter soup, so they need a closer match.
+const SCAN_MIN_SIMILARITY_JOINED = 0.85;
+// Draft screen layout, measured on real phone photos: where each name sits relative to the
+// "Re-Roll Remaining" line under the re-roll button, in units of that line's standard width.
+const SCAN_ANCHOR_TEXT = '1 Re-Roll Remaining';
+const SCAN_NAME_SLOTS = [{ x: -2.72, y: -0.21 }, { x: 0.04, y: -1.77 }, { x: 2.7, y: -0.18 }];
+// Each name is cropped this size (same units) and enlarged to this many pixels tall for reading.
+const SCAN_CROP = { width: 2.6, height: 0.5, textPx: 110 };
 
 const PREFS_KEY = 'brawl-advisor-filters';
 const UI_KEY = 'brawl-advisor-ui';
@@ -842,7 +850,7 @@ function renderHero() {
 
 // ---------- camera scan ----------
 
-const scan = { stream: null, workerPromise: null, readerReady: false, busy: false };
+const scan = { stream: null, workerPromise: null, readerReady: false, busy: false, psm: '11' };
 
 function loadScript(src) {
   return new Promise((resolve, reject) => {
@@ -927,22 +935,25 @@ const SCAN_PASSES = [
 ];
 const scanScale = (width, height, pass) => Math.min(pass.maxScale, pass.side / Math.max(width, height));
 
-/** Draws the source scaled for this pass and in greyscale (reads better), optionally contrast-stretched. */
-function prepareScanCanvas(source, width, height, pass) {
-  const scale = scanScale(width, height, pass);
-  const { stretch } = pass;
+/**
+ * Draws `region` of the source (source pixels) at `scale`, in greyscale (reads better),
+ * optionally contrast-stretched.
+ */
+function greyCanvas(source, region, scale, stretch) {
   const canvas = document.createElement('canvas');
-  canvas.width = Math.round(width * scale);
-  canvas.height = Math.round(height * scale);
+  canvas.width = Math.max(1, Math.round(region.w * scale));
+  canvas.height = Math.max(1, Math.round(region.h * scale));
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(source, region.x, region.y, region.w, region.h, 0, 0, canvas.width, canvas.height);
   const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const px = img.data;
   let lo = 255;
   let hi = 0;
   for (let i = 0; i < px.length; i += 4) {
-    const y = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+    // Rec. 709 weights: red and blue count for little, so the purple/orange card glows go dark and
+    // the cream item names stand out (measurably better than the usual 0.299/0.587/0.114 here).
+    const y = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
     px[i] = px[i + 1] = px[i + 2] = y;
     if (y < lo) lo = y;
     if (y > hi) hi = y;
@@ -954,21 +965,70 @@ function prepareScanCanvas(source, width, height, pass) {
   return canvas;
 }
 
+/** A copy of `src` turned clockwise by `quarterTurns` × 90°. */
+function rotatedCanvas(src, quarterTurns) {
+  const w = src.width;
+  const h = src.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = quarterTurns % 2 ? h : w;
+  canvas.height = quarterTurns % 2 ? w : h;
+  const ctx = canvas.getContext('2d');
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate((quarterTurns * Math.PI) / 2);
+  ctx.drawImage(src, -w / 2, -h / 2);
+  return canvas;
+}
+
+/** Tiny greyscale thumbnail of `src` turned by `quarterTurns`, with its average brightness removed. */
+function orientationThumb(src, quarterTurns, w, h) {
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.translate(w / 2, h / 2);
+  ctx.rotate((quarterTurns * Math.PI) / 2);
+  if (quarterTurns % 2) ctx.drawImage(src, -h / 2, -w / 2, h, w);
+  else ctx.drawImage(src, -w / 2, -h / 2, w, h);
+  const px = ctx.getImageData(0, 0, w, h).data;
+  const grey = [];
+  for (let i = 0; i < px.length; i += 4) grey.push(0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]);
+  const mean = grey.reduce((a, b) => a + b, 0) / grey.length;
+  return grey.map((g) => g - mean);
+}
+
+/**
+ * Some phones (seen on iPhone) return the still photo in the camera sensor's orientation, sideways
+ * compared with the preview. Turns the photo to whichever orientation best matches the preview frame.
+ */
+function matchOrientation(photo, frame) {
+  const w = 48;
+  const h = Math.max(8, Math.round((w * frame.height) / frame.width));
+  const ref = orientationThumb(frame, 0, w, h);
+  let best = 0;
+  let bestDiff = Infinity;
+  for (const turns of [0, 1, 2, 3]) {
+    const t = orientationThumb(photo, turns, w, h);
+    const diff = t.reduce((sum, v, i) => sum + Math.abs(v - ref[i]), 0);
+    if (diff < bestDiff) { best = turns; bestDiff = diff; }
+  }
+  return best ? rotatedCanvas(photo, best) : photo;
+}
+
 async function captureFrame() {
   const video = $('scan-video');
   if (!video.videoWidth || scan.busy) return;
-  // A still photo (Chrome on Android) is sharper and higher resolution than a video frame.
-  const track = scan.stream?.getVideoTracks()[0];
-  if (track && 'ImageCapture' in window) {
-    try {
-      const photo = await createImageBitmap(await new ImageCapture(track).takePhoto());
-      return runScan(photo, photo.width, photo.height, 'camera photo');
-    } catch { /* fall back to the video frame */ }
-  }
   const frame = document.createElement('canvas');
   frame.width = video.videoWidth;
   frame.height = video.videoHeight;
   frame.getContext('2d').drawImage(video, 0, 0);
+  // A still photo is sharper and higher resolution than a video frame, where the browser offers one.
+  const track = scan.stream?.getVideoTracks()[0];
+  if (track && 'ImageCapture' in window) {
+    try {
+      const photo = matchOrientation(await createImageBitmap(await new ImageCapture(track).takePhoto()), frame);
+      return runScan(photo, photo.width, photo.height, 'camera photo');
+    } catch { /* fall back to the video frame */ }
+  }
   return runScan(frame, frame.width, frame.height, 'camera frame');
 }
 
@@ -976,53 +1036,154 @@ async function scanImageFile(file) {
   if (!file) return;
   try {
     const bitmap = await createImageBitmap(file);
-    await runScan(bitmap, bitmap.width, bitmap.height, 'photo file');
+    // No preview to compare against, so if nothing reads upright, try the photo turned either way.
+    for (const turns of [0, 1, 3]) {
+      const img = turns ? rotatedCanvas(bitmap, turns) : bitmap;
+      const n = await runScan(img, img.width, img.height, turns ? 'photo file (rotated)' : 'photo file', { final: turns === 3 });
+      if (n) break;
+    }
   } catch (err) {
     setScanStatus(`Couldn't open that image (${err.message}).`, true);
   }
 }
 
-async function ocrLines(worker, canvas) {
+/** OCR lines with boxes in source pixels; the canvas shows `region` of the source at `scale`. */
+async function ocrLines(worker, canvas, scale, psm = '11', region = { x: 0, y: 0 }) {
+  if (scan.psm !== psm) {
+    await worker.setParameters({ tessedit_pageseg_mode: psm });
+    scan.psm = psm;
+  }
   const { data } = await worker.recognize(canvas, {}, { text: true, blocks: true });
   return (data.blocks || [])
     .flatMap((b) => b.paragraphs.flatMap((p) => p.lines))
-    .map((l) => ({ text: l.text.trim(), box: l.bbox }))
+    .map((l) => ({
+      text: l.text.trim(),
+      box: {
+        x0: region.x + l.bbox.x0 / scale,
+        y0: region.y + l.bbox.y0 / scale,
+        x1: region.x + l.bbox.x1 / scale,
+        y1: region.y + l.bbox.y1 / scale,
+      },
+    }))
     .filter((l) => l.text);
 }
 
-async function runScan(source, width, height, origin) {
-  if (scan.busy) return;
+/**
+ * Finds the "Re-Roll Remaining" line under the re-roll button. Its letter width gives the layout's
+ * scale, so a plural/"0" prefix or a cut-off read doesn't skew it.
+ */
+function findLayoutAnchor(lines) {
+  const a = lines.find((l) => {
+    const t = lettersOnly(l.text);
+    return t.length >= 10 && t.length <= 20 && substringDistance('rerollremaining', t) <= 4;
+  });
+  if (!a) return null;
+  const text = a.text.trim();
+  const charW = (a.box.x1 - a.box.x0) / Math.max(1, text.length);
+  // The italic "1"/"0" in front is often not read; the line's real left edge is then two characters further left.
+  const hasCount = /^[0-9IilO|]/.test(text) && !/^re/i.test(text);
+  const left = hasCount ? a.box.x0 : a.box.x0 - 2 * charW;
+  const unit = charW * SCAN_ANCHOR_TEXT.length;
+  const right = /ing$/.test(lettersOnly(text)) ? a.box.x1 : left + unit; // read cut off before the end
+  return { unit, x: (left + right) / 2, y: (a.box.y0 + a.box.y1) / 2 };
+}
+
+/**
+ * Reads each name position that has no item yet as its own single line: crops it out relative to the
+ * anchor, enlarges it and OCRs it. Much more reliable than whole-photo OCR on the glowing cards.
+ */
+async function readNameSlots(worker, source, width, height, anchor, found, log) {
+  const items = [];
+  for (const [i, slot] of SCAN_NAME_SLOTS.entries()) {
+    const cx = anchor.x + slot.x * anchor.unit;
+    const cy = anchor.y + slot.y * anchor.unit;
+    if (found.some((f) => Math.abs(f.at.x - cx) < 1.2 * anchor.unit && Math.abs(f.at.y - cy) < 0.5 * anchor.unit)) continue;
+    const x0 = Math.max(0, cx - (SCAN_CROP.width * anchor.unit) / 2);
+    const y0 = Math.max(0, cy - (SCAN_CROP.height * anchor.unit) / 2);
+    const x1 = Math.min(width, cx + (SCAN_CROP.width * anchor.unit) / 2);
+    const y1 = Math.min(height, cy + (SCAN_CROP.height * anchor.unit) / 2);
+    if (x1 - x0 < 20 || y1 - y0 < 10) continue;
+    const region = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    const scale = Math.min(4, Math.max(1, SCAN_CROP.textPx / region.h));
+    const canvas = greyCanvas(source, region, scale, true);
+    for (const psm of ['7', '6']) {
+      const text = (await ocrLines(worker, canvas, scale, psm, region)).map((l) => l.text).join(' ');
+      const m = bestItemFor(text, false);
+      log.push({ slot: i, psm, text, item: m?.e.item.name ?? null });
+      if (m) {
+        items.push({ e: m.e, sim: m.sim, at: { x: cx, y: cy }, enhanced: isEnhancedLabel(text) && !!m.e.enh });
+        break;
+      }
+    }
+  }
+  return items;
+}
+
+function mergeFound(...lists) {
+  const byId = new Map();
+  for (const f of lists.flat()) {
+    const prev = byId.get(f.e.id);
+    if (!prev || f.sim > prev.sim) byId.set(f.e.id, { ...f, enhanced: f.enhanced || !!prev?.enhanced });
+    else if (f.enhanced) prev.enhanced = true;
+  }
+  return [...byId.values()];
+}
+
+/**
+ * Reads the offer: whole-photo OCR, then single-line reads of any name positions still missing
+ * (anchored on "Re-Roll Remaining"), then an enlarged whole-photo pass as a last resort.
+ * Returns how many items were found. With `final: false` a miss is silent (the caller retries).
+ */
+async function runScan(source, width, height, origin, { final = true } = {}) {
+  if (scan.busy) return 0;
   scan.busy = true;
   $('scan-capture').disabled = true;
   const started = performance.now();
   try {
     setScanStatus(scan.readerReady ? 'Reading…' : 'Preparing the text reader, then reading…');
     const worker = await ocrWorker();
+    const whole = { x: 0, y: 0, w: width, h: height };
     const [first, second] = SCAN_PASSES;
-    const firstLines = await ocrLines(worker, prepareScanCanvas(source, width, height, first));
+    const slotReads = [];
+
+    const s1 = scanScale(width, height, first);
+    const firstLines = await ocrLines(worker, greyCanvas(source, whole, s1, first.stretch), s1);
     let lines = firstLines;
-    let secondLines = null;
     let found = matchOfferLines(lines);
+    let anchor = findLayoutAnchor(lines);
+    if (found.length < SCAN_EXPECTED && anchor) {
+      found = mergeFound(found, await readNameSlots(worker, source, width, height, anchor, found, slotReads));
+    }
+
+    let secondLines = null;
     if (found.length < SCAN_EXPECTED) {
       setScanStatus(`Found ${found.length} — taking a closer look…`);
-      secondLines = await ocrLines(worker, prepareScanCanvas(source, width, height, second));
-      // The second pass works on a larger image, so bring its boxes back to the first pass's scale.
-      const k = scanScale(width, height, first) / scanScale(width, height, second);
-      lines = lines.concat(secondLines.map((l) => ({ text: l.text, box: { x0: l.box.x0 * k, y0: l.box.y0 * k, x1: l.box.x1 * k, y1: l.box.y1 * k } })));
-      found = matchOfferLines(lines);
+      const s2 = scanScale(width, height, second);
+      secondLines = await ocrLines(worker, greyCanvas(source, whole, s2, second.stretch), s2);
+      lines = firstLines.concat(secondLines);
+      found = mergeFound(found, matchOfferLines(lines));
+      if (found.length < SCAN_EXPECTED && !anchor && (anchor = findLayoutAnchor(secondLines))) {
+        found = mergeFound(found, await readNameSlots(worker, source, width, height, anchor, found, slotReads));
+      }
     }
-    recordScan({ source, width, height, origin, found, firstLines, secondLines, ms: Math.round(performance.now() - started) });
+    markEnhanced(found, lines);
+    found.sort((a, b) => a.at.x - b.at.x);
+
+    if (!found.length && !final) return 0;
+    recordScan({ source, width, height, origin, found, firstLines, secondLines, slotReads, ms: Math.round(performance.now() - started) });
     if (!found.length) {
       const read = lines.map((l) => l.text).filter((t) => t.length > 2).join(' | ');
       setScanStatus(`No item names recognised${read ? ` (read: "${read}")` : ''}. Get the names in frame, hold steady and try again.`, true);
-      return;
+      return 0;
     }
     state.offered = found.map((f) => offerKey(f.e.id, f.enhanced));
     state.scanNote = `Scanned: ${found.map((f) => f.e.item.name + (f.enhanced ? ' (enhanced)' : '')).join(', ')} — wrong? tap to remove, or type to add.`;
     closeScanner();
     renderBoard();
+    return found.length;
   } catch (err) {
     setScanStatus(`Scan failed: ${err.message}`, true);
+    return 0;
   } finally {
     scan.busy = false;
     $('scan-capture').disabled = false;
@@ -1079,7 +1240,7 @@ function jpegOf(source, width, height) {
 }
 
 /** Saves the capture, what was read and what was found. Never blocks or breaks the scan itself. */
-function recordScan({ source, width, height, origin, found, firstLines, secondLines, ms }) {
+function recordScan({ source, width, height, origin, found, firstLines, secondLines, slotReads, ms }) {
   currentScanLog = null;
   if (!state.saveScans || !window.indexedDB) return;
   const lineData = (ls) => ls && ls.map((l) => ({ text: l.text, box: [l.box.x0, l.box.y0, l.box.x1, l.box.y1].map(Math.round) }));
@@ -1094,6 +1255,7 @@ function recordScan({ source, width, height, origin, found, firstLines, secondLi
     final: null, // the offer after any corrections, filled in by noteOfferChange()
     firstPass: lineData(firstLines),
     secondPass: lineData(secondLines),
+    slotReads, // single-line reads of each name position: [{ slot, psm, text, item }]
   };
   const idPromise = (async () => {
     entry.image = await jpegOf(source, width, height);
@@ -1169,7 +1331,11 @@ async function renderScanLog() {
     const diff = scanDiff(e);
     const raw = [['First read', e.firstPass], ['Closer look', e.secondPass]]
       .filter(([, ls]) => ls)
-      .map(([label, ls]) => `${label}: ${ls.map((l) => esc(l.text)).join(' | ') || '(nothing)'}`).join('\n');
+      .map(([label, ls]) => `${label}: ${ls.map((l) => esc(l.text)).join(' | ') || '(nothing)'}`)
+      .concat(e.slotReads?.length
+        ? [`Name areas: ${e.slotReads.map((r) => `${esc(r.text) || '(nothing)'}${r.item ? ` → ${esc(r.item)}` : ''}`).join(' | ')}`]
+        : [])
+      .join('\n');
     return `<div class="log-entry">
       ${url ? `<a href="${url}" target="_blank" rel="noopener"><img class="log-thumb" src="${url}" alt="Scan capture"></a>` : '<div class="log-thumb"></div>'}
       <div class="log-body">
@@ -1241,18 +1407,74 @@ function substringDistance(needle, hay) {
   return Math.min(...prev);
 }
 
-/**
- * Turns OCR lines into offered items: each line is fuzzy-matched against this hero's draft items
- * (tolerating clipped or misread letters), and an "Enhanced" label marks the nearest item.
- */
-function matchOfferLines(lines) {
-  const candidates = state.view.items.entries.map((e) => ({ e, letters: lettersOnly(e.item.name) }));
-  const center = (b) => ({ x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2 });
-  const found = new Map();
-  const enhancedMarks = [];
+function editDistance(a, b) {
+  let prev = [...Array(b.length + 1).keys()];
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
 
+/** This hero's item names prepared for matching, plus words that belong to only one item. */
+function scanVocabulary() {
+  const v = state.view;
+  if (v.scanVocab) return v.scanVocab;
+  const candidates = v.items.entries.map((e) => ({ e, letters: lettersOnly(e.item.name) }));
+  const owners = new Map();
+  for (const c of candidates) {
+    for (const w of new Set(c.e.item.name.toLowerCase().split(/\s+/).map(lettersOnly))) {
+      if (w.length >= 5) owners.set(w, [...(owners.get(w) || []), c.e]);
+    }
+  }
+  const distinctive = [...owners].filter(([, es]) => es.length === 1).map(([w, es]) => ({ w, e: es[0] }));
+  v.scanVocab = { candidates, distinctive };
+  return v.scanVocab;
+}
+
+const isEnhancedLabel = (text) => {
+  const t = lettersOnly(text);
+  return t.length >= 6 && substringDistance('enhanced', t) <= 2;
+};
+
+/**
+ * The item a piece of OCR text names, tolerating clipped or misread letters. Among similar matches it
+ * prefers the name covering more of the text ("Melee Charge", not the "Leech" hidden inside it), and a
+ * word unique to one item ("Spiritual") identifies it even when the rest of the name was lost.
+ */
+function bestItemFor(text, joined) {
+  const { candidates, distinctive } = scanVocabulary();
+  const t = lettersOnly(text);
+  let full = null;
+  if (t.length >= 4) {
+    for (const c of candidates) {
+      if (t.length < c.letters.length * 0.6) continue;
+      const sim = 1 - substringDistance(c.letters, t) / c.letters.length;
+      const score = sim + 0.15 * Math.min(1, c.letters.length / t.length);
+      if (!full || score > full.score) full = { e: c.e, sim, score };
+    }
+    if (full && full.sim < (full.e.item.name.length <= 8 ? SCAN_MIN_SIMILARITY_SHORT : SCAN_MIN_SIMILARITY)) full = null;
+  }
+  let word = null;
+  for (const w of text.toLowerCase().split(/\s+/).map(lettersOnly)) {
+    if (w.length < 6) continue;
+    for (const d of distinctive) {
+      const sim = 1 - editDistance(w, d.w) / d.w.length;
+      if (sim >= 0.85 && (!word || sim > word.sim)) word = { e: d.e, sim };
+    }
+  }
+  const best = word && (!full || full.sim < 0.85) ? word : full;
+  return best && (!joined || best.sim >= SCAN_MIN_SIMILARITY_JOINED) ? best : null;
+}
+
+/** Turns whole-photo OCR lines into offered items, each placed where its name was read. */
+function matchOfferLines(lines) {
+  const center = (b) => ({ x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2 });
+  const chunks = lines.map((l) => ({ ...l, joined: false }));
   // A name can come back as two pieces side by side ("Superior" + "Duration"); try them joined too.
-  const joined = [];
   for (const a of lines) {
     for (const b of lines) {
       if (a === b) continue;
@@ -1260,42 +1482,35 @@ function matchOfferLines(lines) {
       const dy = Math.abs((a.box.y0 + a.box.y1) / 2 - (b.box.y0 + b.box.y1) / 2);
       const gap = b.box.x0 - a.box.x1;
       if (dy < h * 0.6 && gap > -h * 0.5 && gap < h * 2) {
-        joined.push({
+        chunks.push({
           text: `${a.text} ${b.text}`,
           box: { x0: a.box.x0, y0: Math.min(a.box.y0, b.box.y0), x1: b.box.x1, y1: Math.max(a.box.y1, b.box.y1) },
+          joined: true,
         });
       }
     }
   }
-
-  for (const line of [...lines, ...joined]) {
-    const text = lettersOnly(line.text);
-    if (text.length >= 6 && substringDistance('enhanced', text) <= 2) enhancedMarks.push(center(line.box));
-    if (text.length < 4) continue;
-
-    let best = null;
-    for (const c of candidates) {
-      if (text.length < c.letters.length * 0.6) continue;
-      const sim = 1 - substringDistance(c.letters, text) / c.letters.length;
-      if (!best || sim > best.sim) best = { e: c.e, sim };
-    }
-    const needed = best && best.e.item.name.length <= 8 ? SCAN_MIN_SIMILARITY_SHORT : SCAN_MIN_SIMILARITY;
-    if (best && best.sim >= needed && !(found.get(best.e.id)?.sim >= best.sim)) {
-      found.set(best.e.id, { e: best.e, sim: best.sim, at: center(line.box), enhanced: false });
-    }
+  const found = [];
+  for (const c of chunks) {
+    const m = bestItemFor(c.text, c.joined);
+    if (m) found.push({ e: m.e, sim: m.sim, at: center(c.box), enhanced: false });
   }
+  return mergeFound(found);
+}
 
-  const items = [...found.values()];
-  for (const mark of enhancedMarks) {
+/** An "Enhanced" label marks the item whose name is nearest to it. */
+function markEnhanced(found, lines) {
+  for (const l of lines) {
+    if (!isEnhancedLabel(l.text)) continue;
+    const mark = { x: (l.box.x0 + l.box.x1) / 2, y: (l.box.y0 + l.box.y1) / 2 };
     let nearest = null;
     let nearestDist = Infinity;
-    for (const f of items) {
+    for (const f of found) {
       const d = Math.hypot(f.at.x - mark.x, f.at.y - mark.y);
       if (d < nearestDist) { nearest = f; nearestDist = d; }
     }
     if (nearest?.e.enh) nearest.enhanced = true;
   }
-  return items.sort((a, b) => a.at.x - b.at.x);
 }
 
 // ---------- navigation ----------
