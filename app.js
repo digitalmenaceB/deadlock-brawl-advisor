@@ -676,7 +676,6 @@ function renderTray() {
   const all = state.offered.map(resolveOffer).filter(Boolean).sort((a, b) => b.score - a.score);
   if (!all.length) {
     $('tray').innerHTML = '';
-    mirrorPip();
     return;
   }
   // Items flagged as misread stay listed (struck through) but don't count toward the verdict.
@@ -716,7 +715,6 @@ function renderTray() {
         ${fb?.scanned.has(o.key) ? `<button class="flag-btn${isWrong(o) ? ' on' : ''}" data-wrong="${o.key}" title="The scan misread this item">${isWrong(o) ? '✓ Wrong' : 'Wrong'}</button>` : ''}
       </div>`).join('')}
     </div>`;
-  mirrorPip();
 }
 
 function toggleOffer(key) {
@@ -1022,308 +1020,9 @@ function ocrWorker() {
   return scan.workerPromise;
 }
 
-/** Scan progress goes to the camera dialog when it's open, otherwise (screen scans) to the page status. */
 function setScanStatus(msg, isError = false) {
-  if ($('scan').hidden) return setStatus(msg, isError);
   $('scan-status').textContent = msg;
   $('scan-status').classList.toggle('error', isError);
-}
-
-// ---------- screen scan (PC) ----------
-
-// Phones can't share their screen, and the camera is the point there; desktop browsers can.
-const IS_MOBILE = !!navigator.userAgentData?.mobile || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
-const CAN_SCAN_SCREEN = !IS_MOBILE && !!navigator.mediaDevices?.getDisplayMedia;
-
-const CAN_POP_OUT = CAN_SCAN_SCREEN && 'documentPictureInPicture' in window;
-
-// Deadlock keeps the mouse until Esc (which dims the screen) and Alt-Tab minimises it, so a draft can't
-// wait for a click. While the screen is shared it is watched instead: about once a second a small crop
-// where the "Re-Roll Remaining" line sits is read, and when a new offer shows up it is scanned by itself.
-const WATCH_MS = 1000;
-const WATCH_SEARCH_EVERY = 3; // ticks between whole-screen searches while the draft's position is unknown
-const WATCH_RESEARCH_EVERY = 6; // ... and while it is known but not showing (a tooltip may cover the line)
-const WATCH_SETTLE_TICKS = 3; // scan a changing offer anyway after this many ticks (animated cards)
-const WATCH_SIG_CHANGE = 8; // mean grey-level change in a name strip that means the offer changed
-const ANCHOR_KEY = 'brawl-advisor-draft-anchor';
-
-const screenShare = {
-  stream: null,
-  video: null,
-  frame: null, // newest VideoFrame, when the browser can hand them over directly
-  reader: null,
-  stopTicker: null,
-  ticks: 0,
-  checking: false,
-  anchor: null, // where "Re-Roll Remaining" sits on this screen, once found
-  scannedSig: null, // name strips of the last offer scanned, to notice a new one
-  pendingSig: null,
-  waits: 0,
-  statusMsg: '',
-};
-let pipWindow = null;
-
-function setupScanButtons() {
-  if (!CAN_SCAN_SCREEN) return;
-  $('scan-btn').textContent = '🖥 Watch screen';
-  $('scan-btn').title = 'Share the game screen: the draft offer is read automatically whenever it shows up';
-  $('photo-btn').hidden = false;
-  $('pip-btn').hidden = !CAN_POP_OUT;
-}
-
-/**
- * Calls `fn` every `ms`. The clock runs in a worker: once the game covers the browser the page counts
- * as hidden, and browsers slow page timers down to once a minute then, but not worker timers.
- */
-function startTicker(ms, fn) {
-  try {
-    const url = URL.createObjectURL(new Blob([`setInterval(() => postMessage(0), ${ms});`], { type: 'text/javascript' }));
-    const worker = new Worker(url);
-    worker.onmessage = fn;
-    return () => {
-      worker.terminate();
-      URL.revokeObjectURL(url);
-    };
-  } catch {
-    const id = setInterval(fn, ms);
-    return () => clearInterval(id);
-  }
-}
-
-/** Keeps the newest frame of the share. Unlike a <video>, this keeps updating while the page is hidden. */
-async function pumpFrames(track) {
-  try {
-    const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
-    screenShare.reader = reader;
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (screenShare.reader !== reader) {
-        value.close();
-        break;
-      }
-      screenShare.frame?.close();
-      screenShare.frame = value;
-    }
-  } catch { /* the <video> still works while the page is visible */ }
-}
-
-async function startScreenShare() {
-  const stream = await navigator.mediaDevices.getDisplayMedia({
-    video: { displaySurface: 'monitor', frameRate: { ideal: 2, max: 2 } },
-    audio: false,
-    selfBrowserSurface: 'exclude',
-    monitorTypeSurfaces: 'include',
-  });
-  const video = document.createElement('video');
-  video.muted = true;
-  video.playsInline = true;
-  video.srcObject = stream;
-  await video.play();
-  const track = stream.getVideoTracks()[0];
-  track.addEventListener('ended', stopScreenShare);
-  Object.assign(screenShare, { stream, video, ticks: 0, anchor: null, scannedSig: null, pendingSig: null, waits: 0 });
-  if ('MediaStreamTrackProcessor' in window) pumpFrames(track);
-  screenShare.stopTicker = startTicker(WATCH_MS, watchTick);
-  ocrWorker().catch(() => {});
-  $('screen-stop').hidden = false;
-  $('scan-btn').textContent = '🖥 Scan now';
-  $('scan-btn').title = 'Read the shared screen right now (it is also read automatically when a draft shows up)';
-  setWatchStatus('👁 Watching the game screen — the verdict appears here when a draft offer is on screen.');
-}
-
-function stopScreenShare() {
-  screenShare.stopTicker?.();
-  screenShare.reader?.cancel().catch(() => {});
-  screenShare.frame?.close();
-  for (const t of screenShare.stream?.getTracks() || []) t.stop();
-  Object.assign(screenShare, { stream: null, video: null, frame: null, reader: null, stopTicker: null });
-  $('screen-stop').hidden = true;
-  setupScanButtons();
-  setWatchStatus('');
-}
-
-/** Status of the screen watch, on the page and in the pop-out window. */
-function setWatchStatus(msg) {
-  screenShare.statusMsg = msg;
-  $('watch-status').textContent = msg;
-  $('watch-status').hidden = !msg;
-  mirrorPip();
-}
-
-/**
- * Latest frame of the shared screen, at full resolution. Uses the last frame received rather than
- * waiting for a new one: the browser only sends frames when the screen changes.
- */
-function grabScreenFrame() {
-  const { frame, video } = screenShare;
-  const canvas = document.createElement('canvas');
-  canvas.width = frame ? frame.displayWidth : video.videoWidth;
-  canvas.height = frame ? frame.displayHeight : video.videoHeight;
-  if (canvas.width) canvas.getContext('2d').drawImage(frame || video, 0, 0, canvas.width, canvas.height);
-  return canvas;
-}
-
-// The draft layout scales with the screen, so its position is remembered per screen size.
-function savedAnchor(frame) {
-  try {
-    const a = JSON.parse(localStorage.getItem(ANCHOR_KEY) || 'null');
-    return a && a.w === frame.width && a.h === frame.height ? { x: a.x, y: a.y, unit: a.unit } : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveAnchor(frame, a) {
-  try {
-    localStorage.setItem(ANCHOR_KEY, JSON.stringify({ w: frame.width, h: frame.height, x: a.x, y: a.y, unit: a.unit }));
-  } catch { /* storage blocked: it's found again next time */ }
-}
-
-const ANCHOR_LETTERS = 'rerollremaining';
-
-/** Reads just the spot where "Re-Roll Remaining" sits: cheap enough to run every second. */
-async function anchorVisible(worker, frame, a) {
-  const x0 = Math.max(0, a.x - 0.75 * a.unit);
-  const y0 = Math.max(0, a.y - 0.1 * a.unit);
-  const x1 = Math.min(frame.width, a.x + 0.75 * a.unit);
-  const y1 = Math.min(frame.height, a.y + 0.1 * a.unit);
-  if (x1 - x0 < 20 || y1 - y0 < 8) return false;
-  const region = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
-  const scale = Math.min(4, Math.max(0.5, 60 / region.h));
-  const lines = await ocrLines(worker, greyCanvas(frame, region, scale, true), scale, '7', region);
-  return lines.some((l) => substringDistance(ANCHOR_LETTERS, lettersOnly(l.text)) <= 4);
-}
-
-/** Looks for the draft in the middle of the screen; returns its anchor or null. */
-async function findDraftOnScreen(worker, frame) {
-  const region = { x: frame.width * 0.15, y: frame.height * 0.2, w: frame.width * 0.7, h: frame.height * 0.8 };
-  const scale = Math.min(1, 1400 / region.w);
-  const lines = await ocrLines(worker, greyCanvas(frame, region, scale, false), scale, '11', region);
-  return findLayoutAnchor(lines) || inferAnchorFromItems(matchOfferLines(lines));
-}
-
-/** Tiny greyscale copies of the three name strips, to tell when the offer on screen changes. */
-function nameStripSig(frame, a) {
-  const w = 48;
-  const h = 8;
-  const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h * SCAN_NAME_SLOTS.length;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  SCAN_NAME_SLOTS.forEach((s, i) => {
-    const sw = SCAN_CROP.width * a.unit;
-    const sh = SCAN_CROP.height * a.unit;
-    ctx.drawImage(frame, a.x + s.x * a.unit - sw / 2, a.y + s.y * a.unit - sh / 2, sw, sh, 0, i * h, w, h);
-  });
-  const px = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-  const grey = [];
-  for (let i = 0; i < px.length; i += 4) grey.push(0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]);
-  return grey;
-}
-
-/** The largest per-strip mean difference between two signatures. */
-function sigChange(a, b) {
-  if (!a || !b || a.length !== b.length) return Infinity;
-  const per = a.length / SCAN_NAME_SLOTS.length;
-  let worst = 0;
-  for (let s = 0; s < SCAN_NAME_SLOTS.length; s++) {
-    let sum = 0;
-    for (let i = s * per; i < (s + 1) * per; i++) sum += Math.abs(a[i] - b[i]);
-    worst = Math.max(worst, sum / per);
-  }
-  return worst;
-}
-
-async function watchTick() {
-  const w = screenShare;
-  if (!w.stream || !state.view || scan.busy || w.checking) return;
-  w.checking = true;
-  try {
-    const frame = grabScreenFrame();
-    if (!frame.width) return;
-    w.ticks++;
-    const worker = await ocrWorker();
-    w.anchor ||= savedAnchor(frame);
-    let anchor = w.anchor && (await anchorVisible(worker, frame, w.anchor)) ? w.anchor : null;
-    if (!anchor && w.ticks % (w.anchor ? WATCH_RESEARCH_EVERY : WATCH_SEARCH_EVERY) === 0) {
-      anchor = await findDraftOnScreen(worker, frame);
-      if (anchor) {
-        w.anchor = anchor;
-        saveAnchor(frame, anchor);
-      }
-    }
-    if (!anchor) {
-      w.pendingSig = null;
-      w.waits = 0;
-      return setWatchStatus('👁 Watching the game screen — waiting for a draft offer.');
-    }
-    const sig = nameStripSig(frame, anchor);
-    if (sigChange(sig, w.scannedSig) < WATCH_SIG_CHANGE) return; // still the offer already scanned
-    // A new offer: let the cards settle for a tick, unless they never stop moving.
-    const settled = sigChange(sig, w.pendingSig) < WATCH_SIG_CHANGE;
-    w.pendingSig = sig;
-    if (!settled && ++w.waits < WATCH_SETTLE_TICKS) return;
-    w.pendingSig = null;
-    w.waits = 0;
-    w.scannedSig = sig;
-    setWatchStatus('👁 Draft offer on screen — reading…');
-    await runScan(frame, frame.width, frame.height, 'screen (auto)', { auto: true, anchor });
-    setWatchStatus('👁 Offer read — watching for the next draft.');
-  } catch (err) {
-    setWatchStatus(`👁 Watching the game screen — last check failed (${err.message}).`);
-  } finally {
-    w.checking = false;
-  }
-}
-
-/** A small always-on-top window mirroring the verdict, to see it on top of the game. */
-async function openPip() {
-  if (pipWindow) return pipWindow.focus();
-  const pip = await window.documentPictureInPicture.requestWindow({ width: 420, height: 240 });
-  const css = pip.document.createElement('link');
-  css.rel = 'stylesheet';
-  css.href = new URL('styles.css', location.href).href;
-  pip.document.head.append(css);
-  pip.document.title = 'Brawl verdict';
-  pip.document.body.className = 'pip';
-  pip.document.body.innerHTML = '<p class="watch-status"></p><div class="tray"></div>';
-  pip.addEventListener('pagehide', () => { pipWindow = null; });
-  pipWindow = pip;
-  mirrorPip();
-}
-
-function mirrorPip() {
-  if (!pipWindow) return;
-  const doc = pipWindow.document;
-  const hero = state.view ? `${state.view.hero.name}: ` : '';
-  doc.querySelector('.watch-status').textContent = screenShare.statusMsg
-    ? `${hero}${screenShare.statusMsg}`
-    : `${hero}not watching the screen — press 🖥 Watch screen in the main window.`;
-  doc.querySelector('.tray').innerHTML = $('tray').innerHTML;
-}
-
-async function scanScreen() {
-  if (!state.view || scan.busy) return;
-  if (state.itemView !== 'board') {
-    state.itemView = 'board';
-    renderItems();
-  }
-  if (!screenShare.stream) {
-    // Just start watching: right now the screen shows this page, not the draft.
-    try {
-      setStatus('Choose the screen the game is on, then click Share.');
-      await startScreenShare();
-      setStatus('');
-    } catch (err) {
-      stopScreenShare();
-      setStatus(err.name === 'NotAllowedError' ? 'Screen sharing was cancelled.' : `Couldn't share the screen: ${err.message}`, err.name !== 'NotAllowedError');
-    }
-    return;
-  }
-  const frame = grabScreenFrame();
-  if (!frame.width) return setStatus('The shared screen has no picture yet — try again in a second.', true);
-  if (await runScan(frame, frame.width, frame.height, 'screen', { anchor: screenShare.anchor })) setStatus('');
 }
 
 function idleScanStatus() {
@@ -1552,9 +1251,6 @@ function inferAnchorFromItems(found) {
   return best && best.misfit < 0.35 ? { unit: best.unit, x: best.x, y: best.y } : null;
 }
 
-/** Whether a point lies on the draft cards around `anchor` (the name positions plus a margin). */
-const withinLayout = (p, a) => Math.abs(p.x - a.x) < 4.2 * a.unit && p.y > a.y - 2.5 * a.unit && p.y < a.y + 0.6 * a.unit;
-
 /**
  * Reads each name position that has no item yet as its own single line: crops it out relative to the
  * anchor, enlarges it and OCRs it. Much more reliable than whole-photo OCR on the glowing cards.
@@ -1624,41 +1320,35 @@ function mergeFound(...lists) {
  * Reads the offer: whole-photo OCR, then single-line reads of any name positions still missing
  * (anchored on "Re-Roll Remaining"), then an enlarged whole-photo pass as a last resort.
  * Returns how many items were found. With `final: false` a miss is silent (the caller retries).
- * `anchor` is the draft's known position on a shared screen; names found outside the draft layout
- * (e.g. in the pop-out window, which the screen share also sees) are then ignored. `auto` scans (the
- * screen watch) are silent, and only change the offer when they find something new.
  */
-async function runScan(source, width, height, origin, { final = true, auto = false, anchor: knownAnchor = null } = {}) {
+async function runScan(source, width, height, origin, { final = true } = {}) {
   if (scan.busy) return 0;
   scan.busy = true;
   $('scan-capture').disabled = true;
   const started = performance.now();
-  const status = auto ? () => {} : setScanStatus;
   try {
-    status(scan.readerReady ? 'Reading…' : 'Preparing the text reader, then reading…');
+    setScanStatus(scan.readerReady ? 'Reading…' : 'Preparing the text reader, then reading…');
     const worker = await ocrWorker();
     const whole = { x: 0, y: 0, w: width, h: height };
     const [first, second] = SCAN_PASSES;
     const slotReads = [];
-    const inLayout = (list) => (anchor && knownAnchor ? list.filter((f) => withinLayout(f.at, anchor)) : list);
 
     const s1 = scanScale(width, height, first);
     const firstLines = await ocrLines(worker, greyCanvas(source, whole, s1, first.stretch), s1);
     let lines = firstLines;
     let found = matchOfferLines(lines);
-    let anchor = findLayoutAnchor(lines) || knownAnchor || inferAnchorFromItems(found);
-    found = inLayout(found);
+    let anchor = findLayoutAnchor(lines) || inferAnchorFromItems(found);
     if (found.length < SCAN_EXPECTED && anchor) {
       found = mergeFound(found, await readNameSlots(worker, source, width, height, anchor, found, slotReads));
     }
 
     let secondLines = null;
     if (found.length < SCAN_EXPECTED) {
-      status(`Found ${found.length} — taking a closer look…`);
+      setScanStatus(`Found ${found.length} — taking a closer look…`);
       const s2 = scanScale(width, height, second);
       secondLines = await ocrLines(worker, greyCanvas(source, whole, s2, second.stretch), s2);
       lines = firstLines.concat(secondLines);
-      found = mergeFound(found, inLayout(matchOfferLines(lines)));
+      found = mergeFound(found, matchOfferLines(lines));
       if (found.length < SCAN_EXPECTED && !anchor && (anchor = findLayoutAnchor(secondLines) || inferAnchorFromItems(found))) {
         found = mergeFound(found, await readNameSlots(worker, source, width, height, anchor, found, slotReads));
       }
@@ -1668,23 +1358,19 @@ async function runScan(source, width, height, origin, { final = true, auto = fal
     found.sort((a, b) => a.at.x - b.at.x);
 
     if (!found.length && !final) return 0;
-    const keys = found.map((f) => offerKey(f.e.id, f.enhanced));
-    // The watch re-reads an offer when the cards move (hover, Esc menu): keep the offer unless it changed.
-    if (auto && (!found.length || keys.every((k) => state.offered.includes(k)))) return found.length;
     recordScan({ source, width, height, origin, found, firstLines, secondLines, slotReads, ms: Math.round(performance.now() - started) });
     if (!found.length) {
       const read = lines.map((l) => l.text).filter((t) => t.length > 2).join(' | ');
       setScanStatus(`No item names recognised${read ? ` (read: "${read}")` : ''}. Get the names in frame, hold steady and try again.`, true);
       return 0;
     }
-    state.offered = keys;
+    state.offered = found.map((f) => offerKey(f.e.id, f.enhanced));
     state.scanFeedback = { scanned: new Set(state.offered), wrong: new Set(), missing: false };
-    state.scanNote = `${auto ? 'Auto-scanned' : 'Scanned'} ${found.length} item${found.length === 1 ? '' : 's'}${found.length < SCAN_EXPECTED ? ' — type any missing one' : ''}.`;
+    state.scanNote = `Scanned ${found.length} item${found.length === 1 ? '' : 's'}${found.length < SCAN_EXPECTED ? ' — type any missing one' : ''}.`;
     closeScanner();
     renderBoard();
     return found.length;
   } catch (err) {
-    if (auto) throw err;
     setScanStatus(`Scan failed: ${err.message}`, true);
     return 0;
   } finally {
@@ -2040,7 +1726,6 @@ async function openHero(heroId) {
   state.offered = [];
   state.scanNote = '';
   state.scanFeedback = null;
-  screenShare.scannedSig = null; // read the offer on screen again for this hero
   $('picker').hidden = true;
   $('hero-view').hidden = true;
   $('back').hidden = false;
@@ -2198,14 +1883,7 @@ async function init() {
   });
   refreshScanLogCount();
 
-  setupScanButtons();
-  $('scan-btn').addEventListener('click', () => (CAN_SCAN_SCREEN ? scanScreen() : openScanner()));
-  $('screen-stop').addEventListener('click', () => {
-    stopScreenShare();
-    setStatus('');
-  });
-  $('pip-btn').addEventListener('click', () => openPip().catch((err) => setStatus(`Couldn't open the pop-out window: ${err.message}`, true)));
-  $('photo-btn').addEventListener('click', () => $('scan-file').click());
+  $('scan-btn').addEventListener('click', openScanner);
   $('scan-close').addEventListener('click', closeScanner);
   $('scan-capture').addEventListener('click', captureFrame);
   $('scan-file').addEventListener('change', (ev) => {

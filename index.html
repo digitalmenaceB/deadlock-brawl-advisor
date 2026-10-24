@@ -68,12 +68,8 @@
       <div class="search-row">
         <input id="item-search" class="search" type="search" placeholder="Type to find items: initials work (bf = Burst Fire), commas for several, + for enhanced — Enter adds them" autocomplete="off">
         <button id="scan-btn" class="scan-btn" title="Read the draft offer with your camera">📷 Scan</button>
-        <button id="screen-stop" class="scanlog-btn" title="Stop sharing the screen" hidden>Stop sharing</button>
-        <button id="pip-btn" class="scanlog-btn" title="Open a small always-on-top window with the verdict, to see it on top of the game" hidden>📌 Pop-out</button>
-        <button id="photo-btn" class="scanlog-btn" title="Scan a photo or screenshot of the draft" hidden>📁 Photo</button>
         <button id="scanlog-btn" class="scanlog-btn" title="Saved scans, for troubleshooting misses">🗂 Scan log<span id="scanlog-count"></span></button>
       </div>
-      <p id="watch-status" class="watch-status" hidden></p>
 
       <div id="board-view">
         <div class="board-controls">
@@ -109,8 +105,6 @@
           <li>Ranked <em>win rates</em> are deliberately not used: in normal games a player's first big item (e.g. Phantom Strike on Abrams) is compared against items bought later by players who are already ahead, so core items look bad. Street Brawl drafts don't depend on souls, so its win rates are much less skewed.</li>
           <li><b>Enhanced items</b> (✦): Street Brawl sometimes offers a stronger version of an item. Normal and enhanced picks are scored separately, both against the same "typical pick of this tier" baseline, so you can compare an enhanced offer directly with normal ones. Enhanced samples are small, so each one is pulled toward "the normal version + the usual enhanced boost for its tier" unless its own data clearly says otherwise.</li>
           <li><b>📷 Scan</b> reads the item names on the draft screen with on-device text recognition (Tesseract.js, downloaded once from jsDelivr). Photos are processed in your browser and never uploaded. A card labelled "Enhanced" is matched to the nearest item name.</li>
-          <li>On a PC the button is <b>🖥 Watch screen</b>: it asks which screen to share (pick the monitor the game is on), then checks that screen about once a second for the draft's "Re-Roll Remaining" line and reads the offer by itself when one appears — no clicking needed, since the game keeps the mouse. Only draft offers are read and saved; nothing else is analysed beyond that one check, and nothing leaves your PC. <b>Stop sharing</b> ends it. Run the game in borderless windowed mode; exclusive fullscreen can capture as black.</li>
-          <li><b>📌 Pop-out</b> (Chrome and Edge) opens a small always-on-top window with the verdict, so you can see it on top of the game on a single monitor. Put it in a corner, away from the item cards and the re-roll button.</li>
           <li><b>Imbue items</b> (Omnicharge Signet, Compress Cooldown, Duration Extender, …) show which ability to put them on: the one recent popular published builds for this hero choose most. Street Brawl-only items that no build uses fall back to the hero's most-imbued ability, or for Omnicharge Signet an ability that already has charges.</li>
           <li>The <b>±</b> after a win rate is its 95% margin of error. Two numbers whose margins overlap are not clearly different.</li>
           <li><b>Valve tag</b> (★) is the game's own draft table, which marks some items as "Good" for this hero.</li>
