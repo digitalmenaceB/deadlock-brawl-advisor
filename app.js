@@ -1020,9 +1020,87 @@ function ocrWorker() {
   return scan.workerPromise;
 }
 
+/** Scan progress goes to the camera dialog when it's open, otherwise (screen scans) to the page status. */
 function setScanStatus(msg, isError = false) {
+  if ($('scan').hidden) return setStatus(msg, isError);
   $('scan-status').textContent = msg;
   $('scan-status').classList.toggle('error', isError);
+}
+
+// ---------- screen scan (PC) ----------
+
+// Phones can't share their screen, and the camera is the point there; desktop browsers can.
+const IS_MOBILE = !!navigator.userAgentData?.mobile || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+const CAN_SCAN_SCREEN = !IS_MOBILE && !!navigator.mediaDevices?.getDisplayMedia;
+
+// The shared screen: opened on the first Scan click and kept idle (1 fps, nothing analysed) until the
+// next click grabs a frame, so later scans skip the browser's "choose what to share" prompt.
+const screenShare = { stream: null, video: null };
+
+function setupScanButtons() {
+  if (!CAN_SCAN_SCREEN) return;
+  $('scan-btn').textContent = '🖥 Scan screen';
+  $('scan-btn').title = 'Grab the game screen and read the draft offer (first time: choose the monitor the game is on)';
+  $('photo-btn').hidden = false;
+}
+
+async function startScreenShare() {
+  const stream = await navigator.mediaDevices.getDisplayMedia({
+    video: { displaySurface: 'monitor', frameRate: { ideal: 1, max: 2 } },
+    audio: false,
+    selfBrowserSurface: 'exclude',
+    monitorTypeSurfaces: 'include',
+  });
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.srcObject = stream;
+  await video.play();
+  stream.getVideoTracks()[0].addEventListener('ended', stopScreenShare);
+  screenShare.stream = stream;
+  screenShare.video = video;
+  $('screen-stop').hidden = false;
+}
+
+function stopScreenShare() {
+  for (const t of screenShare.stream?.getTracks() || []) t.stop();
+  screenShare.stream = null;
+  screenShare.video = null;
+  $('screen-stop').hidden = true;
+}
+
+/**
+ * Latest frame of the shared screen, at full resolution. Drawn from the video element rather than
+ * waiting for a new frame: the browser only sends frames when the screen changes.
+ */
+function grabScreenFrame() {
+  const { video } = screenShare;
+  const canvas = document.createElement('canvas');
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  canvas.getContext('2d').drawImage(video, 0, 0);
+  return canvas;
+}
+
+async function scanScreen() {
+  if (!state.view || scan.busy) return;
+  if (state.itemView !== 'board') {
+    state.itemView = 'board';
+    renderItems();
+  }
+  if (!screenShare.stream) {
+    try {
+      setStatus('Choose the screen the game is on, then click Share.');
+      await startScreenShare();
+    } catch (err) {
+      stopScreenShare();
+      setStatus(err.name === 'NotAllowedError' ? 'Screen sharing was cancelled.' : `Couldn't share the screen: ${err.message}`, err.name !== 'NotAllowedError');
+      return;
+    }
+  }
+  const frame = grabScreenFrame();
+  if (!frame.width) return setStatus('The shared screen has no picture yet — try again in a second.', true);
+  if (await runScan(frame, frame.width, frame.height, 'screen')) setStatus('');
 }
 
 function idleScanStatus() {
@@ -1883,7 +1961,13 @@ async function init() {
   });
   refreshScanLogCount();
 
-  $('scan-btn').addEventListener('click', openScanner);
+  setupScanButtons();
+  $('scan-btn').addEventListener('click', () => (CAN_SCAN_SCREEN ? scanScreen() : openScanner()));
+  $('screen-stop').addEventListener('click', () => {
+    stopScreenShare();
+    setStatus('');
+  });
+  $('photo-btn').addEventListener('click', () => $('scan-file').click());
   $('scan-close').addEventListener('click', closeScanner);
   $('scan-capture').addEventListener('click', captureFrame);
   $('scan-file').addEventListener('change', (ev) => {
