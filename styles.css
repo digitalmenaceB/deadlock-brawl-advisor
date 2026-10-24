@@ -443,8 +443,18 @@ kbd {
 
 /* Camera scan */
 
-.search-row { display: flex; gap: 8px; max-width: 760px; margin-bottom: 14px; }
-.search-row .search { margin-bottom: 0; flex: 1; min-width: 0; }
+.search-row { display: flex; flex-wrap: wrap; gap: 8px; max-width: 960px; margin-bottom: 14px; }
+.search-row .search { margin-bottom: 0; flex: 1 1 260px; min-width: 0; }
+.watch-status { margin: -6px 0 12px; color: var(--muted); font-size: 13px; }
+.watch-status[hidden] { display: none; }
+
+/* Always-on-top pop-out window (Document Picture-in-Picture) */
+body.pip { margin: 0; padding: 8px; }
+.pip .watch-status { margin: 0 0 6px; }
+.pip .tray { position: static; margin: 0; box-shadow: none; }
+.pip .verdict { font-size: 15px; }
+.pip .clear, .pip .flag-btn, .pip .scan-line, .pip .offer .o-why { display: none; }
+.pip .offer-main { cursor: default; }
 .scan-btn {
   flex: none;
   padding: 6px 14px;
