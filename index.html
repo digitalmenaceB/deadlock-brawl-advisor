@@ -105,6 +105,7 @@
           <li>Ranked <em>win rates</em> are deliberately not used: in normal games a player's first big item (e.g. Phantom Strike on Abrams) is compared against items bought later by players who are already ahead, so core items look bad. Street Brawl drafts don't depend on souls, so its win rates are much less skewed.</li>
           <li><b>Enhanced items</b> (✦): Street Brawl sometimes offers a stronger version of an item. Normal and enhanced picks are scored separately, both against the same "typical pick of this tier" baseline, so you can compare an enhanced offer directly with normal ones. Enhanced samples are small, so each one is pulled toward "the normal version + the usual enhanced boost for its tier" unless its own data clearly says otherwise.</li>
           <li><b>📷 Scan</b> reads the item names on the draft screen with on-device text recognition (Tesseract.js, downloaded once from jsDelivr). Photos are processed in your browser and never uploaded. A card labelled "Enhanced" is matched to the nearest item name.</li>
+          <li><b>Imbue items</b> (Omnicharge Signet, Compress Cooldown, Duration Extender, …) show which ability to put them on: the one recent popular published builds for this hero choose most. Street Brawl-only items that no build uses fall back to the hero's most-imbued ability, or for Omnicharge Signet an ability that already has charges.</li>
           <li>The <b>±</b> after a win rate is its 95% margin of error. Two numbers whose margins overlap are not clearly different.</li>
           <li><b>Valve tag</b> (★) is the game's own draft table, which marks some items as "Good" for this hero.</li>
           <li>Win rate is correlation, not causation: an item can look good partly because of who tends to pick it. A score within about ±1 pt of zero on a few thousand games is within noise.</li>
@@ -135,7 +136,7 @@
         <button id="scanlog-clear">Delete all</button>
         <button id="scanlog-close">Close</button>
       </div>
-      <p class="hint">The newest 50 scans, stored only on this device. If you fix a scan's result (remove a wrong item or add a missed one) before pressing Esc, the fix is recorded here. <b>Export all</b> saves one file with every image and result, to share for troubleshooting.</p>
+      <p class="hint">The newest 50 scans, stored only on this device. After a scan, tap <b>Wrong</b> next to a misread item or <b>Missing an item</b> in the tray — one tap, no fixing needed — and it's recorded here. <b>Export all</b> saves one file with every image and result, to share for troubleshooting.</p>
       <div id="scanlog-list"></div>
     </div>
   </div>

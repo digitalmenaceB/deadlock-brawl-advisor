@@ -58,6 +58,12 @@ const SCAN_CROP = { width: 2.6, height: 0.5, textPx: 110 };
 // The strip checked for an "ENHANCED" label under a name is enlarged to this many pixels tall.
 const SCAN_LABEL_PX = 70;
 
+// Imbue targets come from recent popular published builds; an item needs this many builds that set a
+// target before their choice is trusted over the ability-data fallback.
+const IMBUE_BUILDS = 100;
+const IMBUE_BUILD_WINDOW_DAYS = 120;
+const IMBUE_MIN_BUILDS = 3;
+
 const PREFS_KEY = 'brawl-advisor-filters';
 const UI_KEY = 'brawl-advisor-ui';
 // Offers whose scores are closer than this are reported as a toss-up.
@@ -78,6 +84,8 @@ const state = {
   minGrade: 'all',
   offered: [],
   scanNote: '',
+  // After a scan: { scanned: Set of offer keys it found, wrong: Set flagged as misread, missing: bool }.
+  scanFeedback: null,
   saveScans: true,
 };
 
@@ -353,6 +361,104 @@ function abilityPath(tree, mode, rootMatches, rootWr) {
   return path;
 }
 
+// ---------- imbue targets ----------
+
+/**
+ * Loads recent popular published builds in the background and works out which ability to imbue each
+ * imbue item (Omnicharge Signet, Compress Cooldown, …) on. Re-renders once they arrive.
+ */
+async function loadImbueTargets(token) {
+  const day = Math.floor(Date.now() / 86_400_000) * 86400;
+  let builds = [];
+  try {
+    builds = await getJson('/v1/builds', {
+      hero_id: state.view.hero.id,
+      only_latest: true,
+      sort_by: 'weekly_favorites',
+      sort_direction: 'desc',
+      limit: IMBUE_BUILDS,
+      min_unix_timestamp: day - IMBUE_BUILD_WINDOW_DAYS * 86400,
+    });
+  } catch { /* fall back to ability-data rules below */ }
+  if (token !== state.loadToken || !state.view) return;
+  state.view.imbue = imbueRecommendations(builds);
+  renderItems();
+}
+
+function imbueRecommendations(builds) {
+  const v = state.view;
+  // Which of the hero's abilities an item may go on, per the item's imbue rule.
+  const eligible = (item, id) => {
+    const a = v.abilities.get(id);
+    if (!a || !v.signatures.has(id)) return false;
+    if (item.imbue === 'imbue_active_non_ult') return a.active && !a.ultimate;
+    if (item.imbue === 'imbue_active') return a.active;
+    return true;
+  };
+
+  const perItem = new Map(); // item id -> Map(ability id -> builds)
+  const overall = new Map(); // ability id -> builds imbuing it with any item
+  for (const b of builds || []) {
+    for (const cat of b.hero_build?.details?.mod_categories || []) {
+      for (const m of cat.mods || []) {
+        const item = state.upgrades.get(m.ability_id);
+        const target = m.imbue_target_ability_id;
+        if (!item?.imbue || !target || !v.signatures.has(target)) continue;
+        if (!perItem.has(item.id)) perItem.set(item.id, new Map());
+        perItem.get(item.id).set(target, (perItem.get(item.id).get(target) || 0) + 1);
+        overall.set(target, (overall.get(target) || 0) + 1);
+      }
+    }
+  }
+
+  const recs = new Map();
+  for (const e of v.items.entries) {
+    const item = e.item;
+    if (!item.imbue) continue;
+    const options = [...(perItem.get(item.id) || [])].filter(([id]) => eligible(item, id)).sort((a, b) => b[1] - a[1]);
+    const total = options.reduce((sum, [, n]) => sum + n, 0);
+    if (total >= IMBUE_MIN_BUILDS) {
+      recs.set(item.id, { abilityId: options[0][0], count: options[0][1], total, runnerUp: options[1] ?? null, source: 'builds' });
+      continue;
+    }
+    // Too few builds use it (e.g. Street Brawl-only Legendary items): fall back to the ability data.
+    const allowed = [...v.signatures].filter((id) => eligible(item, id)).sort((a, b) => (overall.get(b) || 0) - (overall.get(a) || 0));
+    const charged = allowed.filter((id) => v.abilities.get(id).charges > 0);
+    if (item.properties?.BonusAbilityCharges && charged.length) recs.set(item.id, { abilityId: charged[0], source: 'charges' });
+    else if (allowed.length && overall.get(allowed[0])) recs.set(item.id, { abilityId: allowed[0], source: 'overall' });
+  }
+  return recs;
+}
+
+/** The recommended imbue target, as a compact chip or a full sentence for the details panel. */
+function imbueHtml(e, long = false) {
+  const v = state.view;
+  const r = v.imbue?.get(e.id);
+  if (!r) return '';
+  const a = v.abilities.get(r.abilityId);
+  const icon = a.image ? `<img src="${esc(a.image)}" alt="">` : '';
+  if (!long) {
+    const title = r.source === 'builds' ? `${r.count} of ${r.total} recent builds imbue it here` : 'No builds use this item; based on the ability data';
+    return `<span class="imbue-chip" title="${esc(title)}">Imbue → ${icon}${esc(a.name)}</span>`;
+  }
+  const hero = esc(v.hero.name);
+  if (r.source === 'builds') {
+    const other = r.runnerUp ? ` (next: ${esc(v.abilities.get(r.runnerUp[0]).name)}, ${r.runnerUp[1]})` : '';
+    return `Imbue it on <span class="imbue-chip">${icon}${esc(a.name)}</span> — chosen in ${r.count} of ${r.total} recent ${hero} builds that set a target${other}.`;
+  }
+  if (r.source === 'charges') {
+    return `Imbue it on <span class="imbue-chip">${icon}${esc(a.name)}</span> — no builds use this item, but ${esc(a.name)} already has charges and this item gives charged abilities extra.`;
+  }
+  return `Imbue it on <span class="imbue-chip">${icon}${esc(a.name)}</span> — no builds use this item; it's the ability ${hero} builds imbue most with other items.`;
+}
+
+/** Small ability icon on a draft tile for imbue items. */
+function imbueBadge(e) {
+  const r = state.view.imbue?.get(e.id);
+  const a = r && state.view.abilities.get(r.abilityId);
+  return a?.image ? `<span class="imbue-badge" title="Imbue on ${esc(a.name)}"><img src="${esc(a.image)}" alt=""></span>` : '';
+}
+
 // ---------- rendering: picker ----------
 
 function heroImage(hero) {
@@ -540,6 +646,7 @@ function tileHtml(e, isTopMatch = false) {
       <span class="t-grade">${e.grade.label}</span>
       ${e.core ? '<span class="core-tag">Core</span>' : ''}
       <img src="${esc(itemImage(e.item))}" alt="" loading="lazy">
+      ${imbueBadge(e)}
       <span class="t-name">${esc(e.item.name)}</span>
     </button>
     ${enhStrip}
@@ -564,16 +671,21 @@ const offerName = (o) => `${esc(o.e.item.name)}${o.enhanced ? ' <span class="enh
 
 function renderTray() {
   const v = state.view;
-  const offered = state.offered.map(resolveOffer).filter(Boolean).sort((a, b) => b.score - a.score);
-  if (!offered.length) {
+  const fb = state.scanFeedback;
+  const isWrong = (o) => !!fb?.wrong.has(o.key);
+  const all = state.offered.map(resolveOffer).filter(Boolean).sort((a, b) => b.score - a.score);
+  if (!all.length) {
     $('tray').innerHTML = '';
     return;
   }
+  // Items flagged as misread stay listed (struck through) but don't count toward the verdict.
+  const offered = all.filter((o) => !isWrong(o));
 
   const [top, next] = offered;
   const name = (o) => `<b>${offerName(o)}</b>`;
   let verdict;
-  if (!next) verdict = `${name(top)} is <span class="grade g-${top.grade.key}">${top.grade.label}</span> on ${esc(v.hero.name)} — add the other options to compare.`;
+  if (!top) verdict = 'Every scanned item is marked wrong — type the offer to compare.';
+  else if (!next) verdict = `${name(top)} is <span class="grade g-${top.grade.key}">${top.grade.label}</span> on ${esc(v.hero.name)} — add the other options to compare.`;
   else if (top.score - next.score < CLOSE_CALL_PTS) verdict = `Close call: ${name(top)} or ${name(next)} — pick whichever fits your build.`;
   else verdict = `Take ${name(top)} <span class="pos">${signed(top.score - next.score)} pts</span> over ${offerName(next)}`;
 
@@ -581,19 +693,27 @@ function renderTray() {
   const mixedNote = offeredTiers.size > 1
     ? `<p class="hint">Mixed tiers (${[...offeredTiers].sort().map((t) => `T${t}`).join(', ')}): each score compares an item with its own tier, so treat this verdict as a rough guide.</p>`
     : '';
+  const scanLine = state.scanNote
+    ? `<p class="hint scan-line">📷 ${state.scanNote}
+        <button class="flag-btn${fb?.missing ? ' on' : ''}" data-action="missing">${fb?.missing ? '✓ Marked: missing an item' : 'Missing an item'}</button></p>`
+    : '';
 
+  let rank = 0;
   $('tray').innerHTML = `
     <div class="verdict">${verdict}<button class="clear" data-action="clear">Clear (Esc)</button></div>
-    ${state.scanNote ? `<p class="hint">📷 ${state.scanNote}</p>` : ''}
+    ${scanLine}
     ${mixedNote}
-    <div class="offer-list">${offered.map((o, i) => `
-      <button class="offer" data-key="${o.key}" title="Remove from offer">
-        <span class="rk">${i + 1}</span>
-        <img src="${esc(itemImage(o.e.item))}" alt="">
-        <span>${offerName(o)}<span class="o-why">${shortReason(o)}</span></span>
-        <span class="sc">${signed(o.score)}</span>
-        <span class="grade g-${o.grade.key}">${o.grade.label}</span>
-      </button>`).join('')}
+    <div class="offer-list">${[...offered, ...all.filter(isWrong)].map((o) => `
+      <div class="offer${isWrong(o) ? ' is-wrong' : ''}">
+        <button class="offer-main" data-key="${o.key}" title="Remove from offer">
+          <span class="rk">${isWrong(o) ? '✗' : ++rank}</span>
+          <img src="${esc(itemImage(o.e.item))}" alt="">
+          <span>${offerName(o)} ${imbueHtml(o.e)}<span class="o-why">${shortReason(o)}</span></span>
+          <span class="sc">${signed(o.score)}</span>
+          <span class="grade g-${o.grade.key}">${o.grade.label}</span>
+        </button>
+        ${fb?.scanned.has(o.key) ? `<button class="flag-btn${isWrong(o) ? ' on' : ''}" data-wrong="${o.key}" title="The scan misread this item">${isWrong(o) ? '✓ Wrong' : 'Wrong'}</button>` : ''}
+      </div>`).join('')}
     </div>`;
 }
 
@@ -603,9 +723,28 @@ function toggleOffer(key) {
   renderBoard();
 }
 
+/** One-tap scan feedback: flag a scanned item as misread, or the scan as having missed an item. */
+function toggleWrongFlag(key) {
+  const fb = state.scanFeedback;
+  if (!fb) return;
+  if (fb.wrong.has(key)) fb.wrong.delete(key);
+  else fb.wrong.add(key);
+  noteScanFeedback();
+  renderTray();
+}
+
+function toggleMissingFlag() {
+  const fb = state.scanFeedback;
+  if (!fb) return;
+  fb.missing = !fb.missing;
+  noteScanFeedback();
+  renderTray();
+}
+
 function clearOffer() {
   state.offered = [];
   state.scanNote = '';
+  state.scanFeedback = null;
   currentScanLog = null; // the next round's changes aren't corrections to the last scan
   if (state.view && state.itemView === 'board') renderBoard();
 }
@@ -660,6 +799,8 @@ function whyHtml(e) {
   reasons.push(`Drafted in <b>${fmtN(s.matches)}</b> ${hero} Street Brawl games (${pct(s.pick)}) — won <b>${pct(s.wr)}</b> <span class="moe">(±${s.margin.toFixed(1)})</span> vs ${hero}'s ${pct(v.sb.base)} average.`);
   reasons.push(`Street Brawl: <span class="${signClass(s.rel)}">${signed(s.rel)} pts</span> vs a typical Tier ${tier} pick. Overall #${e.rank} of ${e.tierSize} Tier ${tier} items for ${hero}.`);
   if (s.matches < LOW_DATA_MATCHES) reasons.push(`Small sample — treat this grade as a rough hint.`);
+  const imbue = imbueHtml(e, true);
+  if (imbue) reasons.push(imbue);
 
   if (s.pick >= tierStat.medianPick * 2.5) reasons.push(`One of the most-drafted Tier ${tier} items for ${hero}, so players like it when it's offered.`);
   else if (s.pick <= tierStat.medianPick * 0.35) reasons.push(`Rarely drafted on ${hero}.`);
@@ -1224,7 +1365,8 @@ async function runScan(source, width, height, origin, { final = true } = {}) {
       return 0;
     }
     state.offered = found.map((f) => offerKey(f.e.id, f.enhanced));
-    state.scanNote = `Scanned: ${found.map((f) => f.e.item.name + (f.enhanced ? ' (enhanced)' : '')).join(', ')} — wrong? tap to remove, or type to add.`;
+    state.scanFeedback = { scanned: new Set(state.offered), wrong: new Set(), missing: false };
+    state.scanNote = `Scanned ${found.length} item${found.length === 1 ? '' : 's'}${found.length < SCAN_EXPECTED ? ' — type any missing one' : ''}.`;
     closeScanner();
     renderBoard();
     return found.length;
@@ -1318,15 +1460,26 @@ function recordScan({ source, width, height, origin, found, firstLines, secondLi
   currentScanLog = { idPromise };
 }
 
-/** Records the offer as the user corrected it (items added or removed after a scan). */
-function noteOfferChange() {
+/** Merges `patch` into the latest scan's log entry. */
+function patchCurrentScan(patch) {
   const log = currentScanLog;
   if (!log) return;
-  const final = offerSummary(state.offered);
   log.idPromise.then((id) => withScanStore('readwrite', (s) => {
     const req = s.get(id);
-    req.onsuccess = () => { if (req.result) s.put({ ...req.result, final }); };
+    req.onsuccess = () => { if (req.result) s.put({ ...req.result, ...patch }); };
   })).catch(() => {});
+}
+
+/** Records the offer as the user corrected it (items added or removed after a scan). */
+function noteOfferChange() {
+  patchCurrentScan({ final: offerSummary(state.offered) });
+}
+
+/** Records the one-tap flags: which scanned items were misread, and whether an item was missed. */
+function noteScanFeedback() {
+  const fb = state.scanFeedback;
+  if (!fb) return;
+  patchCurrentScan({ flags: { wrong: offerSummary([...fb.wrong]), missing: fb.missing } });
 }
 
 async function refreshScanLogCount() {
@@ -1390,8 +1543,10 @@ async function renderScanLog() {
         <div>Found: ${e.found.length ? names(e.found) : '<span class="neg">nothing</span>'}</div>
         ${diff?.missed.length ? `<div class="neg">Missed: ${diff.missed.map(esc).join(', ')}</div>` : ''}
         ${diff?.wrong.length ? `<div class="neg">Wrong: ${diff.wrong.map(esc).join(', ')}</div>` : ''}
+        ${e.flags?.wrong?.length ? `<div class="neg">⚑ Flagged wrong: ${names(e.flags.wrong)}</div>` : ''}
+        ${e.flags?.missing ? '<div class="neg">⚑ Flagged: missing an item</div>' : ''}
         ${diff && !diff.missed.length && !diff.wrong.length ? '<div class="pos">Correct (confirmed by your edits)</div>' : ''}
-        ${!diff ? '<div class="hint">No corrections made after this scan.</div>' : ''}
+        ${!diff && !e.flags?.wrong?.length && !e.flags?.missing ? '<div class="hint">Not flagged or corrected.</div>' : ''}
         <details><summary>Raw text read</summary><pre>${raw}</pre></details>
         <div class="log-actions">
           ${url ? `<a class="btn" href="${url}" download="scan-${e.id}-${esc(e.hero)}.jpg">Download image</a>` : ''}
@@ -1569,6 +1724,8 @@ async function openHero(heroId) {
   state.hero = hero;
   state.openItem = null;
   state.offered = [];
+  state.scanNote = '';
+  state.scanFeedback = null;
   $('picker').hidden = true;
   $('hero-view').hidden = true;
   $('back').hidden = false;
@@ -1599,13 +1756,21 @@ async function openHero(heroId) {
     const abilities = new Map();
     for (const a of heroItems) {
       if (a.type !== 'ability') continue;
-      abilities.set(a.id, { name: a.name, image: a.image_webp || a.image });
+      const p = a.properties || {};
+      abilities.set(a.id, {
+        name: a.name,
+        image: a.image_webp || a.image,
+        ultimate: a.ability_type === 'ultimate',
+        active: Number(p.AbilityCooldown?.value) > 0,
+        charges: Number(p.AbilityCharges?.value) || 0,
+      });
       if (sigClasses.has(a.class_name)) signatures.add(a.id);
     }
 
     state.view = { hero, sb, ranked, tree, abilities, signatures, mode: f.mode, items: buildItemView(hero, sb, ranked, builds, f.mode) };
     renderHero();
     $('hero-view').hidden = false;
+    loadImbueTargets(token);
     const missing = [!enhancedRows ? 'enhanced-item stats' : '', f.badge && !ranked ? 'expert-rank data' : '', !builds ? 'published builds' : '', !tree ? 'ability orders' : ''].filter(Boolean);
     setStatus(missing.length ? `Loaded, but couldn't fetch: ${missing.join(', ')}.` : '');
   } catch (err) {
@@ -1696,7 +1861,10 @@ async function init() {
   });
   $('tray').addEventListener('click', (ev) => {
     if (ev.target.closest('[data-action="clear"]')) return clearOffer();
-    const offer = ev.target.closest('.offer');
+    if (ev.target.closest('[data-action="missing"]')) return toggleMissingFlag();
+    const flag = ev.target.closest('[data-wrong]');
+    if (flag) return toggleWrongFlag(flag.dataset.wrong);
+    const offer = ev.target.closest('.offer-main');
     if (offer) toggleOffer(offer.dataset.key);
   });
   $('scanlog-btn').addEventListener('click', openScanLog);

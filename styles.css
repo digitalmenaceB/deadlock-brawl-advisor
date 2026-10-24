@@ -373,25 +373,73 @@ kbd {
 .verdict b { color: var(--accent); }
 .verdict .clear { margin-left: auto; background: none; border: 1px solid var(--line); color: var(--muted); border-radius: 6px; padding: 3px 10px; cursor: pointer; font: inherit; font-size: 12px; }
 .offer-list { display: grid; gap: 4px; }
-.offer {
+.offer { display: flex; align-items: center; gap: 6px; padding-right: 6px; background: var(--panel); border-radius: 6px; }
+.offer:hover { outline: 1px solid var(--line); }
+.offer-main {
+  flex: 1;
+  min-width: 0;
   display: grid;
   grid-template-columns: 22px 34px 1fr auto auto;
   align-items: center;
   gap: 8px;
   padding: 4px 6px;
-  background: var(--panel);
+  background: none;
   border: 0;
-  border-radius: 6px;
   color: var(--text);
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
-.offer:hover { outline: 1px solid var(--line); }
 .offer .rk { color: var(--muted); font-weight: 700; text-align: center; }
-.offer img { width: 34px; height: 34px; object-fit: contain; }
+.offer-main > img { width: 34px; height: 34px; object-fit: contain; }
 .offer .o-why { display: block; font-size: 11px; color: var(--muted); }
 .offer .sc { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--muted); }
+.offer.is-wrong .offer-main { opacity: 0.45; text-decoration: line-through; }
+
+/* One-tap scan feedback */
+.flag-btn {
+  flex: none;
+  padding: 3px 9px;
+  background: none;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.flag-btn:hover { color: var(--text); border-color: var(--g-avoid); }
+.flag-btn.on { color: #fff; background: var(--g-avoid); border-color: var(--g-avoid); }
+.scan-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+
+/* Imbue target */
+.imbue-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px 0 4px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  text-decoration: none;
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+.imbue-chip img { width: 16px; height: 16px; object-fit: contain; }
+.tile .imbue-badge {
+  position: absolute;
+  top: 30px;
+  left: calc(50% + 10px);
+  width: 24px;
+  height: 24px;
+  padding: 2px;
+  border: 1px solid var(--accent);
+  border-radius: 50%;
+  background: var(--bg);
+}
+.tile .imbue-badge img { width: 100%; height: 100%; object-fit: contain; }
 
 /* Camera scan */
 
