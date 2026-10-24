@@ -68,6 +68,7 @@
       <div class="search-row">
         <input id="item-search" class="search" type="search" placeholder="Type to find items: initials work (bf = Burst Fire), commas for several, + for enhanced — Enter adds them" autocomplete="off">
         <button id="scan-btn" class="scan-btn" title="Read the draft offer with your camera">📷 Scan</button>
+        <button id="scanlog-btn" class="scanlog-btn" title="Saved scans, for troubleshooting misses">🗂 Scan log<span id="scanlog-count"></span></button>
       </div>
 
       <div id="board-view">
@@ -121,6 +122,21 @@
         <label class="scan-file">Use a photo<input id="scan-file" type="file" accept="image/*" hidden></label>
         <button id="scan-close">Close</button>
       </div>
+      <p class="hint">Scans are saved on this device only (never uploaded) so misses can be reviewed — see 🗂 Scan log.</p>
+    </div>
+  </div>
+
+  <div id="scanlog" class="scan" hidden>
+    <div class="scan-box scanlog-box" role="dialog" aria-label="Scan log">
+      <div class="scanlog-head">
+        <h2>Scan log</h2>
+        <label><input id="scanlog-enabled" type="checkbox"> Save scans</label>
+        <button id="scanlog-export">Export all</button>
+        <button id="scanlog-clear">Delete all</button>
+        <button id="scanlog-close">Close</button>
+      </div>
+      <p class="hint">The newest 50 scans, stored only on this device. If you fix a scan's result (remove a wrong item or add a missed one) before pressing Esc, the fix is recorded here. <b>Export all</b> saves one file with every image and result, to share for troubleshooting.</p>
+      <div id="scanlog-list"></div>
     </div>
   </div>
 

@@ -446,6 +446,45 @@ kbd {
 .scan-actions .primary { flex: 1; background: var(--accent); border-color: var(--accent); color: #111; font-weight: 700; font-size: 16px; }
 .scan-actions button:disabled { opacity: 0.6; cursor: wait; }
 
+/* Scan log */
+
+.scanlog-btn {
+  flex: none;
+  padding: 6px 12px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  cursor: pointer;
+}
+.scanlog-btn:hover { border-color: var(--accent); }
+.scanlog-box { max-height: calc(100vh - 32px); overflow-y: auto; }
+.scanlog-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.scanlog-head h2 { margin: 0 auto 0 0; }
+.scanlog-head label { color: var(--muted); display: flex; align-items: center; gap: 4px; }
+.scanlog-head button, .log-actions button, .log-actions .btn {
+  padding: 5px 12px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+  text-decoration: none;
+  cursor: pointer;
+}
+.log-entry { display: grid; grid-template-columns: 180px 1fr; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
+.log-thumb { width: 180px; height: 100px; object-fit: cover; border-radius: 6px; background: var(--panel-2); display: block; }
+.log-body { min-width: 0; font-size: 13px; }
+.log-meta { color: var(--muted); font-size: 12px; margin-bottom: 2px; }
+.log-body pre { white-space: pre-wrap; word-break: break-word; font-size: 11px; color: var(--muted); margin: 4px 0; }
+.log-actions { display: flex; gap: 6px; margin-top: 6px; }
+@media (max-width: 640px) {
+  .log-entry { grid-template-columns: 1fr; }
+  .log-thumb { width: 100%; height: 140px; }
+}
+
 /* Abilities */
 
 .ability-controls { display: flex; gap: 18px; margin-bottom: 10px; color: var(--muted); }

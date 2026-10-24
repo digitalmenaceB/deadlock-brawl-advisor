@@ -68,6 +68,7 @@ const state = {
   minGrade: 'all',
   offered: [],
   scanNote: '',
+  saveScans: true,
 };
 
 const requestCache = new Map();
@@ -139,13 +140,14 @@ function loadPrefs() {
     if (ui.itemView === 'board' || ui.itemView === 'list') state.itemView = ui.itemView;
     if (ui.boardTier === 'all' || Number.isInteger(ui.boardTier)) state.boardTier = ui.boardTier;
     if (ui.minGrade in GRADE_FILTERS) state.minGrade = ui.minGrade;
+    if (typeof ui.saveScans === 'boolean') state.saveScans = ui.saveScans;
   } catch { /* storage unavailable */ }
 }
 
 function savePrefs() {
   try {
     localStorage.setItem(PREFS_KEY, JSON.stringify({ 'f-days': $('f-days').value, 'f-badge': $('f-badge').value, 'f-mode': $('f-mode').value }));
-    localStorage.setItem(UI_KEY, JSON.stringify({ itemView: state.itemView, boardTier: state.boardTier, minGrade: state.minGrade }));
+    localStorage.setItem(UI_KEY, JSON.stringify({ itemView: state.itemView, boardTier: state.boardTier, minGrade: state.minGrade, saveScans: state.saveScans }));
   } catch { /* storage unavailable */ }
 }
 
@@ -587,12 +589,14 @@ function renderTray() {
 
 function toggleOffer(key) {
   state.offered = state.offered.includes(key) ? state.offered.filter((x) => x !== key) : [...state.offered, key];
+  noteOfferChange();
   renderBoard();
 }
 
 function clearOffer() {
   state.offered = [];
   state.scanNote = '';
+  currentScanLog = null; // the next round's changes aren't corrections to the last scan
   if (state.view && state.itemView === 'board') renderBoard();
 }
 
@@ -958,21 +962,21 @@ async function captureFrame() {
   if (track && 'ImageCapture' in window) {
     try {
       const photo = await createImageBitmap(await new ImageCapture(track).takePhoto());
-      return runScan(photo, photo.width, photo.height);
+      return runScan(photo, photo.width, photo.height, 'camera photo');
     } catch { /* fall back to the video frame */ }
   }
   const frame = document.createElement('canvas');
   frame.width = video.videoWidth;
   frame.height = video.videoHeight;
   frame.getContext('2d').drawImage(video, 0, 0);
-  return runScan(frame, frame.width, frame.height);
+  return runScan(frame, frame.width, frame.height, 'camera frame');
 }
 
 async function scanImageFile(file) {
   if (!file) return;
   try {
     const bitmap = await createImageBitmap(file);
-    await runScan(bitmap, bitmap.width, bitmap.height);
+    await runScan(bitmap, bitmap.width, bitmap.height, 'photo file');
   } catch (err) {
     setScanStatus(`Couldn't open that image (${err.message}).`, true);
   }
@@ -986,24 +990,28 @@ async function ocrLines(worker, canvas) {
     .filter((l) => l.text);
 }
 
-async function runScan(source, width, height) {
+async function runScan(source, width, height, origin) {
   if (scan.busy) return;
   scan.busy = true;
   $('scan-capture').disabled = true;
+  const started = performance.now();
   try {
     setScanStatus(scan.readerReady ? 'Reading…' : 'Preparing the text reader, then reading…');
     const worker = await ocrWorker();
     const [first, second] = SCAN_PASSES;
-    let lines = await ocrLines(worker, prepareScanCanvas(source, width, height, first));
+    const firstLines = await ocrLines(worker, prepareScanCanvas(source, width, height, first));
+    let lines = firstLines;
+    let secondLines = null;
     let found = matchOfferLines(lines);
     if (found.length < SCAN_EXPECTED) {
       setScanStatus(`Found ${found.length} — taking a closer look…`);
-      const closer = await ocrLines(worker, prepareScanCanvas(source, width, height, second));
+      secondLines = await ocrLines(worker, prepareScanCanvas(source, width, height, second));
       // The second pass works on a larger image, so bring its boxes back to the first pass's scale.
       const k = scanScale(width, height, first) / scanScale(width, height, second);
-      lines = lines.concat(closer.map((l) => ({ text: l.text, box: { x0: l.box.x0 * k, y0: l.box.y0 * k, x1: l.box.x1 * k, y1: l.box.y1 * k } })));
+      lines = lines.concat(secondLines.map((l) => ({ text: l.text, box: { x0: l.box.x0 * k, y0: l.box.y0 * k, x1: l.box.x1 * k, y1: l.box.y1 * k } })));
       found = matchOfferLines(lines);
     }
+    recordScan({ source, width, height, origin, found, firstLines, secondLines, ms: Math.round(performance.now() - started) });
     if (!found.length) {
       const read = lines.map((l) => l.text).filter((t) => t.length > 2).join(' | ');
       setScanStatus(`No item names recognised${read ? ` (read: "${read}")` : ''}. Get the names in frame, hold steady and try again.`, true);
@@ -1019,6 +1027,203 @@ async function runScan(source, width, height) {
     scan.busy = false;
     $('scan-capture').disabled = false;
   }
+}
+
+// ---------- scan log (saved on this device for troubleshooting misses) ----------
+
+const SCAN_DB_NAME = 'brawl-advisor';
+const SCAN_STORE = 'scans';
+const SCAN_LOG_LIMIT = 50;
+const SCAN_LOG_IMAGE_SIDE = 2400;
+
+let scanDbPromise = null;
+// The latest scan's log entry, kept so corrections to that offer can be recorded against it.
+let currentScanLog = null;
+let scanLogUrls = [];
+
+function scanDb() {
+  if (!scanDbPromise) {
+    scanDbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(SCAN_DB_NAME, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(SCAN_STORE, { keyPath: 'id', autoIncrement: true });
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    scanDbPromise.catch(() => { scanDbPromise = null; });
+  }
+  return scanDbPromise;
+}
+
+/** Runs `fn(store)` in one transaction; resolves with the value of the request it returns, if any. */
+async function withScanStore(mode, fn) {
+  const db = await scanDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SCAN_STORE, mode);
+    const req = fn(tx.objectStore(SCAN_STORE));
+    tx.oncomplete = () => resolve(req?.result);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+const offerSummary = (keys) => keys.map(resolveOffer).filter(Boolean).map((o) => ({ name: o.e.item.name, enhanced: o.enhanced }));
+
+function jpegOf(source, width, height) {
+  const scale = Math.min(1, SCAN_LOG_IMAGE_SIDE / Math.max(width, height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(width * scale);
+  canvas.height = Math.round(height * scale);
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+  return new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+}
+
+/** Saves the capture, what was read and what was found. Never blocks or breaks the scan itself. */
+function recordScan({ source, width, height, origin, found, firstLines, secondLines, ms }) {
+  currentScanLog = null;
+  if (!state.saveScans || !window.indexedDB) return;
+  const lineData = (ls) => ls && ls.map((l) => ({ text: l.text, box: [l.box.x0, l.box.y0, l.box.x1, l.box.y1].map(Math.round) }));
+  const entry = {
+    time: new Date().toISOString(),
+    hero: state.view.hero.name,
+    heroId: state.view.hero.id,
+    origin,
+    size: [width, height],
+    ms,
+    found: found.map((f) => ({ name: f.e.item.name, enhanced: f.enhanced, similarity: Math.round(f.sim * 100) / 100 })),
+    final: null, // the offer after any corrections, filled in by noteOfferChange()
+    firstPass: lineData(firstLines),
+    secondPass: lineData(secondLines),
+  };
+  const idPromise = (async () => {
+    entry.image = await jpegOf(source, width, height);
+    const id = await withScanStore('readwrite', (s) => s.add(entry));
+    const keys = await withScanStore('readonly', (s) => s.getAllKeys());
+    if (keys.length > SCAN_LOG_LIMIT) {
+      await withScanStore('readwrite', (s) => { for (const k of keys.slice(0, keys.length - SCAN_LOG_LIMIT)) s.delete(k); });
+    }
+    refreshScanLogCount();
+    return id;
+  })();
+  idPromise.catch(() => {});
+  currentScanLog = { idPromise };
+}
+
+/** Records the offer as the user corrected it (items added or removed after a scan). */
+function noteOfferChange() {
+  const log = currentScanLog;
+  if (!log) return;
+  const final = offerSummary(state.offered);
+  log.idPromise.then((id) => withScanStore('readwrite', (s) => {
+    const req = s.get(id);
+    req.onsuccess = () => { if (req.result) s.put({ ...req.result, final }); };
+  })).catch(() => {});
+}
+
+async function refreshScanLogCount() {
+  try {
+    const n = await withScanStore('readonly', (s) => s.count());
+    $('scanlog-count').textContent = n ? ` (${n})` : '';
+  } catch { /* storage unavailable */ }
+}
+
+function scanDiff(entry) {
+  if (!entry.final) return null;
+  const key = (x) => `${x.name}${x.enhanced ? ' (enhanced)' : ''}`;
+  const found = new Set(entry.found.map(key));
+  const final = new Set(entry.final.map(key));
+  return { missed: [...final].filter((k) => !found.has(k)), wrong: [...found].filter((k) => !final.has(k)) };
+}
+
+async function openScanLog() {
+  $('scanlog').hidden = false;
+  $('scanlog-enabled').checked = state.saveScans;
+  await renderScanLog();
+}
+
+function closeScanLog() {
+  $('scanlog').hidden = true;
+  for (const u of scanLogUrls) URL.revokeObjectURL(u);
+  scanLogUrls = [];
+  $('scanlog-list').innerHTML = '';
+}
+
+async function renderScanLog() {
+  for (const u of scanLogUrls) URL.revokeObjectURL(u);
+  scanLogUrls = [];
+  let entries;
+  try {
+    entries = (await withScanStore('readonly', (s) => s.getAll())).reverse();
+  } catch (err) {
+    $('scanlog-list').innerHTML = `<p class="status error">Couldn't open the scan log (${esc(err.message)}).</p>`;
+    return;
+  }
+  if (!entries.length) {
+    $('scanlog-list').innerHTML = '<p class="status">No saved scans yet.</p>';
+    return;
+  }
+  const names = (list) => list.map((x) => esc(x.name) + (x.enhanced ? ' <span class="enh-tag">✦</span>' : '')).join(', ');
+  $('scanlog-list').innerHTML = entries.map((e) => {
+    const url = e.image ? URL.createObjectURL(e.image) : '';
+    if (url) scanLogUrls.push(url);
+    const diff = scanDiff(e);
+    const raw = [['First read', e.firstPass], ['Closer look', e.secondPass]]
+      .filter(([, ls]) => ls)
+      .map(([label, ls]) => `${label}: ${ls.map((l) => esc(l.text)).join(' | ') || '(nothing)'}`).join('\n');
+    return `<div class="log-entry">
+      ${url ? `<a href="${url}" target="_blank" rel="noopener"><img class="log-thumb" src="${url}" alt="Scan capture"></a>` : '<div class="log-thumb"></div>'}
+      <div class="log-body">
+        <div class="log-meta">${esc(new Date(e.time).toLocaleString())} · ${esc(e.hero)} · ${esc(e.origin)} · ${(e.ms / 1000).toFixed(1)} s</div>
+        <div>Found: ${e.found.length ? names(e.found) : '<span class="neg">nothing</span>'}</div>
+        ${diff?.missed.length ? `<div class="neg">Missed: ${diff.missed.map(esc).join(', ')}</div>` : ''}
+        ${diff?.wrong.length ? `<div class="neg">Wrong: ${diff.wrong.map(esc).join(', ')}</div>` : ''}
+        ${diff && !diff.missed.length && !diff.wrong.length ? '<div class="pos">Correct (confirmed by your edits)</div>' : ''}
+        ${!diff ? '<div class="hint">No corrections made after this scan.</div>' : ''}
+        <details><summary>Raw text read</summary><pre>${raw}</pre></details>
+        <div class="log-actions">
+          ${url ? `<a class="btn" href="${url}" download="scan-${e.id}-${esc(e.hero)}.jpg">Download image</a>` : ''}
+          <button data-del="${e.id}">Delete</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+/** Downloads every saved scan (images included) as one JSON file to share for troubleshooting. */
+async function exportScanLog() {
+  const entries = await withScanStore('readonly', (s) => s.getAll());
+  if (!entries.length) return;
+  const scans = await Promise.all(entries.map(async (e) => ({
+    ...e,
+    image: e.image ? await blobToDataUrl(e.image) : null,
+    missed: scanDiff(e)?.missed ?? null,
+    wrong: scanDiff(e)?.wrong ?? null,
+  })));
+  const blob = new Blob([JSON.stringify({ app: 'brawl-draft-advisor', exported: new Date().toISOString(), scans }, null, 1)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  a.download = `brawl-scans-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+async function deleteScanLog(id) {
+  await withScanStore('readwrite', (s) => (id === undefined ? s.clear() : s.delete(id)));
+  if (id === undefined) currentScanLog = null;
+  refreshScanLogCount();
+  renderScanLog();
 }
 
 const lettersOnly = (s) => s.toLowerCase().replace(/[^a-z]/g, '');
@@ -1194,6 +1399,7 @@ async function init() {
         const key = offerKey(m.e.id, m.enhanced);
         if (!state.offered.includes(key)) state.offered.push(key);
       }
+      noteOfferChange();
       ev.target.value = '';
       renderBoard();
     } else if (ev.key === 'Escape') {
@@ -1231,6 +1437,22 @@ async function init() {
     const offer = ev.target.closest('.offer');
     if (offer) toggleOffer(offer.dataset.key);
   });
+  $('scanlog-btn').addEventListener('click', openScanLog);
+  $('scanlog-close').addEventListener('click', closeScanLog);
+  $('scanlog-export').addEventListener('click', () => exportScanLog().catch((err) => alert(`Export failed: ${err.message}`)));
+  $('scanlog-clear').addEventListener('click', () => {
+    if (confirm('Delete all saved scans on this device?')) deleteScanLog().catch(() => {});
+  });
+  $('scanlog-enabled').addEventListener('change', (ev) => {
+    state.saveScans = ev.target.checked;
+    savePrefs();
+  });
+  $('scanlog-list').addEventListener('click', (ev) => {
+    const del = ev.target.closest('[data-del]');
+    if (del) deleteScanLog(Number(del.dataset.del)).catch(() => {});
+  });
+  refreshScanLogCount();
+
   $('scan-btn').addEventListener('click', openScanner);
   $('scan-close').addEventListener('click', closeScanner);
   $('scan-capture').addEventListener('click', captureFrame);
@@ -1242,6 +1464,10 @@ async function init() {
   document.addEventListener('keydown', (ev) => {
     if (!$('scan').hidden) {
       if (ev.key === 'Escape') closeScanner();
+      return;
+    }
+    if (!$('scanlog').hidden) {
+      if (ev.key === 'Escape') closeScanLog();
       return;
     }
     if (!state.view || ev.ctrlKey || ev.metaKey || ev.altKey) return;
