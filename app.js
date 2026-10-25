@@ -1359,6 +1359,24 @@ async function readEnhancedLabels(worker, source, width, height, found, log) {
   }
 }
 
+/**
+ * A draft offers exactly three items. When more were matched (e.g. from an open tooltip), keeps the
+ * three most likely to be card names: on the cards around the re-roll line (when it was found), then
+ * in the biggest text, then the closest reads.
+ */
+function mostLikelyOffer(found, anchor) {
+  const onCards = (f) => !!anchor && Math.abs(f.at.x - anchor.x) < 4.2 * anchor.unit
+    && f.at.y > anchor.y - 2.5 * anchor.unit && f.at.y < anchor.y + 0.6 * anchor.unit;
+  const rank = (f) => [onCards(f) ? 1 : 0, f.box.y1 - f.box.y0, f.sim];
+  return [...found]
+    .sort((a, b) => {
+      const ra = rank(a);
+      const rb = rank(b);
+      return rb[0] - ra[0] || rb[1] - ra[1] || rb[2] - ra[2];
+    })
+    .slice(0, SCAN_EXPECTED);
+}
+
 function mergeFound(...lists) {
   const byId = new Map();
   for (const f of lists.flat()) {
@@ -1408,6 +1426,7 @@ async function runScan(source, width, height, origin, { final = true } = {}) {
     }
     markEnhanced(found, lines);
     await readEnhancedLabels(worker, source, width, height, found, slotReads);
+    if (found.length > SCAN_EXPECTED) found = mostLikelyOffer(found, anchor);
     found.sort((a, b) => a.at.x - b.at.x);
 
     if (!found.length && !final) return 0;
