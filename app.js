@@ -47,6 +47,8 @@ const SCAN_EXPECTED = 3;
 // Share of an item name's letters that must match a line of OCR text (short names need more).
 const SCAN_MIN_SIMILARITY = 0.7;
 const SCAN_MIN_SIMILARITY_SHORT = 0.8;
+const SCAN_MIN_SIMILARITY_LONG_LINE = 0.9; // for a name found inside a line over twice its length
+const SCAN_MIN_WORD_SHARE = 0.4; // a word naming an item on its own must be this share of the line's letters
 // Two fragments joined into one chunk can make letter soup, so they need a closer match.
 const SCAN_MIN_SIMILARITY_JOINED = 0.85;
 // Draft screen layout, measured on real phone photos: where each name sits relative to the
@@ -55,8 +57,12 @@ const SCAN_ANCHOR_TEXT = '1 Re-Roll Remaining';
 const SCAN_NAME_SLOTS = [{ x: -2.72, y: -0.21 }, { x: 0.04, y: -1.77 }, { x: 2.7, y: -0.18 }];
 // Each name is cropped this size (same units) and enlarged to this many pixels tall for reading.
 const SCAN_CROP = { width: 2.6, height: 0.5, textPx: 110 };
+// Reads tried for a name position, in order: crop offset (layout units) and page-segmentation mode.
+const SCAN_SLOT_TRIES = [{ dy: 0, psm: '7' }, { dy: 0, psm: '6' }, { dy: 0.2, psm: '7' }, { dy: -0.2, psm: '7' }];
 // The strip checked for an "ENHANCED" label under a name is enlarged to this many pixels tall.
 const SCAN_LABEL_PX = 70;
+// Whole-photo matches whose text is less than this share of two other matched names' are dropped.
+const SCAN_MIN_NAME_HEIGHT = 0.65;
 
 // Imbue targets come from recent popular published builds; an item needs this many builds that set a
 // target before their choice is trusted over the ability-data fallback.
@@ -1108,6 +1114,46 @@ function greyCanvas(source, region, scale, stretch) {
   return canvas;
 }
 
+/**
+ * The "ENHANCED" label is cyan text with a deep-blue glow. In plain greyscale it can blend into a
+ * bright green or orange card ring, so keep only bluish pixels (blue well above red, which also drops
+ * the white item name) and split them by green level: the light letters from the darker glow, at the
+ * level that best separates the two (Otsu's method), since an overexposed photo pushes both up.
+ * Black letters on white, as the reader prefers.
+ */
+function cyanCanvas(source, region, scale) {
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(region.w * scale));
+  canvas.height = Math.max(1, Math.round(region.h * scale));
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(source, region.x, region.y, region.w, region.h, 0, 0, canvas.width, canvas.height);
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const px = img.data;
+  const hist = new Array(256).fill(0);
+  for (let i = 0; i < px.length; i += 4) {
+    px[i] = px[i + 2] - px[i] > 80 ? px[i + 1] : 0;
+    if (px[i]) hist[px[i]]++;
+  }
+  const n = hist.reduce((a, b) => a + b, 0);
+  const total = hist.reduce((a, c, v) => a + c * v, 0);
+  let threshold = 255;
+  let best = 0;
+  for (let t = 0, below = 0, belowSum = 0; t < 256; t++) {
+    below += hist[t];
+    belowSum += t * hist[t];
+    if (!below || below === n) continue;
+    const spread = below * (n - below) * (belowSum / below - (total - belowSum) / (n - below)) ** 2;
+    if (spread > best) {
+      best = spread;
+      threshold = t;
+    }
+  }
+  for (let i = 0; i < px.length; i += 4) px[i] = px[i + 1] = px[i + 2] = px[i] > threshold ? 0 : 255;
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
 /** A copy of `src` turned clockwise by `quarterTurns` × 90°. */
 function rotatedCanvas(src, quarterTurns) {
   const w = src.width;
@@ -1261,21 +1307,23 @@ async function readNameSlots(worker, source, width, height, anchor, found, log) 
     const cx = anchor.x + slot.x * anchor.unit;
     const cy = anchor.y + slot.y * anchor.unit;
     if (found.some((f) => Math.abs(f.at.x - cx) < 1.2 * anchor.unit && Math.abs(f.at.y - cy) < 0.5 * anchor.unit)) continue;
-    const x0 = Math.max(0, cx - (SCAN_CROP.width * anchor.unit) / 2);
-    const y0 = Math.max(0, cy - (SCAN_CROP.height * anchor.unit) / 2);
-    const x1 = Math.min(width, cx + (SCAN_CROP.width * anchor.unit) / 2);
-    const y1 = Math.min(height, cy + (SCAN_CROP.height * anchor.unit) / 2);
-    if (x1 - x0 < 20 || y1 - y0 < 10) continue;
-    const region = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
-    const scale = Math.min(4, Math.max(1, SCAN_CROP.textPx / region.h));
-    const canvas = greyCanvas(source, region, scale, true);
-    for (const psm of ['7', '6']) {
-      const text = (await ocrLines(worker, canvas, scale, psm, region)).map((l) => l.text).join(' ');
+    // Photos taken at an angle can put a name a little above or below its expected spot, cutting it off
+    // at the crop's edge; a miss is retried with the crop moved down, then up.
+    for (const { dy, psm } of SCAN_SLOT_TRIES) {
+      const y = cy + dy * anchor.unit;
+      const x0 = Math.max(0, cx - (SCAN_CROP.width * anchor.unit) / 2);
+      const y0 = Math.max(0, y - (SCAN_CROP.height * anchor.unit) / 2);
+      const x1 = Math.min(width, cx + (SCAN_CROP.width * anchor.unit) / 2);
+      const y1 = Math.min(height, y + (SCAN_CROP.height * anchor.unit) / 2);
+      if (x1 - x0 < 20 || y1 - y0 < 10) continue;
+      const region = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+      const scale = Math.min(4, Math.max(1, SCAN_CROP.textPx / region.h));
+      const text = (await ocrLines(worker, greyCanvas(source, region, scale, true), scale, psm, region)).map((l) => l.text).join(' ');
       const m = bestItemFor(text, false);
-      log.push({ slot: i, psm, text, item: m?.e.item.name ?? null });
+      log.push({ slot: i, psm, dy, text, item: m?.e.item.name ?? null });
       if (m) {
-        const nameBox = { x0: cx - 0.8 * anchor.unit, y0: cy - 0.12 * anchor.unit, x1: cx + 0.8 * anchor.unit, y1: cy + 0.12 * anchor.unit };
-        items.push({ e: m.e, sim: m.sim, at: { x: cx, y: cy }, box: nameBox, enhanced: isEnhancedLabel(text) && !!m.e.enh });
+        const nameBox = { x0: cx - 0.8 * anchor.unit, y0: y - 0.12 * anchor.unit, x1: cx + 0.8 * anchor.unit, y1: y + 0.12 * anchor.unit };
+        items.push({ e: m.e, sim: m.sim, at: { x: cx, y }, box: nameBox, enhanced: isEnhancedLabel(text) && !!m.e.enh });
         break;
       }
     }
@@ -1300,9 +1348,14 @@ async function readEnhancedLabels(worker, source, width, height, found, log) {
     if (x1 - x0 < 20 || y1 - y0 < 8) continue;
     const region = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
     const scale = Math.min(4, Math.max(1, SCAN_LABEL_PX / region.h));
-    const text = (await ocrLines(worker, greyCanvas(source, region, scale, true), scale, '7', region)).map((l) => l.text).join(' ');
-    log.push({ label: f.e.item.name, text });
-    if (isEnhancedLabel(text)) f.enhanced = true;
+    for (const [prep, canvas] of [['grey', () => greyCanvas(source, region, scale, true)], ['cyan', () => cyanCanvas(source, region, scale)]]) {
+      const text = (await ocrLines(worker, canvas(), scale, '7', region)).map((l) => l.text).join(' ');
+      log.push({ label: f.e.item.name, prep, text });
+      if (isEnhancedLabel(text)) {
+        f.enhanced = true;
+        break;
+      }
+    }
   }
 }
 
@@ -1658,12 +1711,17 @@ function bestItemFor(text, joined) {
       const score = sim + 0.15 * Math.min(1, c.letters.length / t.length);
       if (!full || score > full.score) full = { e: c.e, sim, score };
     }
-    if (full && full.sim < (full.e.item.name.length <= 8 ? SCAN_MIN_SIMILARITY_SHORT : SCAN_MIN_SIMILARITY)) full = null;
+    // In a line much longer than the name (a sentence, e.g. "Spirit Damage Returned" in a tooltip), a
+    // loose match is usually chance, so only a near-exact one counts there.
+    const long = full && t.length > 2 * lettersOnly(full.e.item.name).length;
+    if (full && full.sim < (long ? SCAN_MIN_SIMILARITY_LONG_LINE : full.e.item.name.length <= 8 ? SCAN_MIN_SIMILARITY_SHORT : SCAN_MIN_SIMILARITY)) full = null;
   }
   let word = null;
   for (const w of text.toLowerCase().split(/\s+/).map(lettersOnly)) {
     if (w.length < 6) continue;
     for (const d of distinctive) {
+      // One word of a whole sentence ("…abilities or weapon") doesn't name an item.
+      if (t.length > 2 * lettersOnly(d.e.item.name).length || w.length < SCAN_MIN_WORD_SHARE * t.length) continue;
       const sim = 1 - editDistance(w, d.w) / d.w.length;
       if (sim >= 0.85 && (!word || sim > word.sim)) word = { e: d.e, sim };
     }
@@ -1697,10 +1755,19 @@ function matchOfferLines(lines) {
     const m = bestItemFor(c.text, c.joined);
     if (m) found.push({ e: m.e, sim: m.sim, at: center(c.box), box: c.box, enhanced: false });
   }
-  return mergeFound(found);
+  // Card names share one big font, so an item read in much smaller text than two others is something
+  // else, e.g. an item's tooltip. Each item's tightest box counts: OCR sometimes merges a name with the
+  // art around it into one tall box, and a single tall box mustn't push real names out.
+  const height = new Map();
+  for (const f of found) height.set(f.e.id, Math.min(height.get(f.e.id) ?? Infinity, f.box.y1 - f.box.y0));
+  const small = (id) => [...height].filter(([other, h]) => other !== id && SCAN_MIN_NAME_HEIGHT * h > height.get(id)).length >= 2;
+  return mergeFound(found.filter((f) => !small(f.e.id)));
 }
 
-/** An "Enhanced" label marks the item whose name is nearest to it. */
+/**
+ * An "Enhanced" label marks the item whose name sits directly above it. A label under a name that
+ * wasn't read marks nothing, rather than the next card over.
+ */
 function markEnhanced(found, lines) {
   for (const l of lines) {
     if (!isEnhancedLabel(l.text)) continue;
@@ -1708,6 +1775,9 @@ function markEnhanced(found, lines) {
     let nearest = null;
     let nearestDist = Infinity;
     for (const f of found) {
+      const h = f.box.y1 - f.box.y0;
+      const below = mark.y > f.box.y1 - 0.5 * h && mark.y < f.box.y1 + 2.5 * h;
+      if (!below || mark.x < f.box.x0 - h || mark.x > f.box.x1 + h) continue;
       const d = Math.hypot(f.at.x - mark.x, f.at.y - mark.y);
       if (d < nearestDist) { nearest = f; nearestDist = d; }
     }
