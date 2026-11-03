@@ -132,11 +132,13 @@
       <div class="scanlog-head">
         <h2>Scan log</h2>
         <label><input id="scanlog-enabled" type="checkbox"> Save scans</label>
+        <button id="scanlog-export-problems">Export problems</button>
         <button id="scanlog-export">Export all</button>
         <button id="scanlog-clear">Delete all</button>
         <button id="scanlog-close">Close</button>
       </div>
-      <p class="hint">The newest 50 scans, stored only on this device. After a scan, tap <b>Wrong</b> next to a misread item or <b>Missing an item</b> in the tray — one tap, no fixing needed — and it's recorded here. <b>Export all</b> saves one file with every image and result, to share for troubleshooting.</p>
+      <p class="hint">The newest 50 scans, stored only on this device. After a scan, tap <b>Wrong</b> next to a misread item, <b>Missing an item</b>, or <b>✦</b> to switch an item between normal and enhanced — it's recorded here. Scans that didn't find exactly 3 items count as problems automatically. <b>Export problems</b> packs just those (images and results) into ZIP files small enough for Discord, ready to share.</p>
+      <div id="scanlog-export-panel" class="export-panel" hidden></div>
       <div id="scanlog-list"></div>
     </div>
   </div>

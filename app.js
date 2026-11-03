@@ -718,6 +718,8 @@ function renderTray() {
           <span class="sc">${signed(o.score)}</span>
           <span class="grade g-${o.grade.key}">${o.grade.label}</span>
         </button>
+        ${o.e.enh ? `<button class="flag-btn enh-btn${o.enhanced ? ' on' : ''}" data-enh="${o.key}"
+            title="${o.enhanced ? 'Offered as enhanced — tap to switch to the normal version' : 'Offered as normal — tap to switch to the enhanced version'}">✦ ${o.enhanced ? 'Enhanced' : 'Normal'}</button>` : ''}
         ${fb?.scanned.has(o.key) ? `<button class="flag-btn${isWrong(o) ? ' on' : ''}" data-wrong="${o.key}" title="The scan misread this item">${isWrong(o) ? '✓ Wrong' : 'Wrong'}</button>` : ''}
       </div>`).join('')}
     </div>`;
@@ -725,6 +727,24 @@ function renderTray() {
 
 function toggleOffer(key) {
   state.offered = state.offered.includes(key) ? state.offered.filter((x) => x !== key) : [...state.offered, key];
+  noteOfferChange();
+  renderBoard();
+}
+
+/** Switches an offered item between its normal and enhanced version, keeping its place in the offer.
+ *  After a scan, this is recorded as a correction (the scan misread the Enhanced label). */
+function toggleEnhanced(key) {
+  const o = resolveOffer(key);
+  if (!o?.e.enh) return;
+  const next = offerKey(o.e.id, !o.enhanced);
+  state.offered = state.offered.includes(next)
+    ? state.offered.filter((k) => k !== key)
+    : state.offered.map((k) => (k === key ? next : k));
+  const fb = state.scanFeedback;
+  if (fb?.scanned.delete(key)) {
+    fb.scanned.add(next);
+    if (fb.wrong.delete(key)) noteScanFeedback(); // the name was right; the enhancement was what was wrong
+  }
   noteOfferChange();
   renderBoard();
 }
@@ -1438,7 +1458,8 @@ async function runScan(source, width, height, origin, { final = true } = {}) {
     }
     state.offered = found.map((f) => offerKey(f.e.id, f.enhanced));
     state.scanFeedback = { scanned: new Set(state.offered), wrong: new Set(), missing: false };
-    state.scanNote = `Scanned ${found.length} item${found.length === 1 ? '' : 's'}${found.length < SCAN_EXPECTED ? ' — type any missing one' : ''}.`;
+    state.scanNote = `Scanned ${found.length} item${found.length === 1 ? '' : 's'}`
+      + (found.length < SCAN_EXPECTED ? ` — type any missing one.${state.saveScans ? ' Logged as a scan problem.' : ''}` : '.');
     closeScanner();
     renderBoard();
     return found.length;
@@ -1561,12 +1582,38 @@ async function refreshScanLogCount() {
   } catch { /* storage unavailable */ }
 }
 
-function scanDiff(entry) {
+/** What the user changed after the scan: items it missed, items it got wrong, and items whose
+ *  Enhanced label it misread (same item, other version). Null if the offer was never edited. */
+function scanCorrections(entry) {
   if (!entry.final) return null;
   const key = (x) => `${x.name}${x.enhanced ? ' (enhanced)' : ''}`;
   const found = new Set(entry.found.map(key));
   const final = new Set(entry.final.map(key));
-  return { missed: [...final].filter((k) => !found.has(k)), wrong: [...found].filter((k) => !final.has(k)) };
+  let missed = entry.final.filter((x) => !found.has(key(x)));
+  let wrong = entry.found.filter((x) => !final.has(key(x)));
+  const enhanced = missed.filter((x) => wrong.some((w) => w.name === x.name));
+  const fixedNames = new Set(enhanced.map((x) => x.name));
+  missed = missed.filter((x) => !fixedNames.has(x.name));
+  wrong = wrong.filter((x) => !fixedNames.has(x.name));
+  return {
+    missed: missed.map(key),
+    wrong: wrong.map(key),
+    enhanced: enhanced.map((x) => `${x.name} → ${x.enhanced ? 'enhanced' : 'normal'}`),
+  };
+}
+
+/** Every reason a saved scan counts as a problem; empty when it looks right. */
+function scanProblems(entry) {
+  const out = [];
+  if (entry.found.length !== SCAN_EXPECTED) out.push(`Found ${entry.found.length} item${entry.found.length === 1 ? '' : 's'}, not ${SCAN_EXPECTED}`);
+  const c = scanCorrections(entry);
+  if (c?.enhanced.length) out.push(`Enhanced fixed: ${c.enhanced.join(', ')}`);
+  if (c?.missed.length) out.push(`Missed: ${c.missed.join(', ')}`);
+  if (c?.wrong.length) out.push(`Wrong: ${c.wrong.join(', ')}`);
+  const flagged = entry.flags?.wrong?.map((x) => `${x.name}${x.enhanced ? ' (enhanced)' : ''}`) ?? [];
+  if (flagged.length) out.push(`Flagged wrong: ${flagged.join(', ')}`);
+  if (entry.flags?.missing) out.push('Flagged: missing an item');
+  return out;
 }
 
 async function openScanLog() {
@@ -1580,6 +1627,7 @@ function closeScanLog() {
   for (const u of scanLogUrls) URL.revokeObjectURL(u);
   scanLogUrls = [];
   $('scanlog-list').innerHTML = '';
+  clearExport();
 }
 
 async function renderScanLog() {
@@ -1592,6 +1640,10 @@ async function renderScanLog() {
     $('scanlog-list').innerHTML = `<p class="status error">Couldn't open the scan log (${esc(err.message)}).</p>`;
     return;
   }
+  const problemCount = entries.filter((e) => scanProblems(e).length).length;
+  $('scanlog-export-problems').textContent = `Export problems (${problemCount})`;
+  $('scanlog-export-problems').disabled = !problemCount;
+  $('scanlog-export').disabled = !entries.length;
   if (!entries.length) {
     $('scanlog-list').innerHTML = '<p class="status">No saved scans yet.</p>';
     return;
@@ -1600,7 +1652,7 @@ async function renderScanLog() {
   $('scanlog-list').innerHTML = entries.map((e) => {
     const url = e.image ? URL.createObjectURL(e.image) : '';
     if (url) scanLogUrls.push(url);
-    const diff = scanDiff(e);
+    const problems = scanProblems(e);
     const raw = [['First read', e.firstPass], ['Closer look', e.secondPass]]
       .filter(([, ls]) => ls)
       .map(([label, ls]) => `${label}: ${ls.map((l) => esc(l.text)).join(' | ') || '(nothing)'}`)
@@ -1613,12 +1665,8 @@ async function renderScanLog() {
       <div class="log-body">
         <div class="log-meta">${esc(new Date(e.time).toLocaleString())} · ${esc(e.hero)} · ${esc(e.origin)} · ${(e.ms / 1000).toFixed(1)} s</div>
         <div>Found: ${e.found.length ? names(e.found) : '<span class="neg">nothing</span>'}</div>
-        ${diff?.missed.length ? `<div class="neg">Missed: ${diff.missed.map(esc).join(', ')}</div>` : ''}
-        ${diff?.wrong.length ? `<div class="neg">Wrong: ${diff.wrong.map(esc).join(', ')}</div>` : ''}
-        ${e.flags?.wrong?.length ? `<div class="neg">⚑ Flagged wrong: ${names(e.flags.wrong)}</div>` : ''}
-        ${e.flags?.missing ? '<div class="neg">⚑ Flagged: missing an item</div>' : ''}
-        ${diff && !diff.missed.length && !diff.wrong.length ? '<div class="pos">Correct (confirmed by your edits)</div>' : ''}
-        ${!diff && !e.flags?.wrong?.length && !e.flags?.missing ? '<div class="hint">Not flagged or corrected.</div>' : ''}
+        ${problems.map((p) => `<div class="neg">⚑ ${esc(p)}</div>`).join('')}
+        ${!problems.length ? (e.final ? '<div class="pos">Correct (confirmed by your edits)</div>' : '<div class="hint">Not flagged or corrected.</div>') : ''}
         <details><summary>Raw text read</summary><pre>${raw}</pre></details>
         <div class="log-actions">
           ${url ? `<a class="btn" href="${url}" download="scan-${e.id}-${esc(e.hero)}.jpg">Download image</a>` : ''}
@@ -1629,34 +1677,167 @@ async function renderScanLog() {
   }).join('');
 }
 
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
-    r.readAsDataURL(blob);
-  });
+// ---------- scan log export (ZIP parts sized for Discord, shareable from the phone) ----------
+
+// Discord's free upload limit is 10 MB per file and 10 files per message; stay safely under both.
+const EXPORT_PART_BYTES = 9_500_000;
+const EXPORT_PART_IMAGES = 9;
+
+let exportParts = []; // [{ zip: File, loose: File[], url }]
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
 }
 
-/** Downloads every saved scan (images included) as one JSON file to share for troubleshooting. */
-async function exportScanLog() {
-  const entries = await withScanStore('readonly', (s) => s.getAll());
-  if (!entries.length) return;
-  const scans = await Promise.all(entries.map(async (e) => ({
-    ...e,
-    image: e.image ? await blobToDataUrl(e.image) : null,
-    missed: scanDiff(e)?.missed ?? null,
-    wrong: scanDiff(e)?.wrong ?? null,
-  })));
-  const blob = new Blob([JSON.stringify({ app: 'brawl-draft-advisor', exported: new Date().toISOString(), scans }, null, 1)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
+/** Builds an uncompressed ZIP (JPEGs don't shrink further, so storing them is just as small). */
+function makeZip(files, date = new Date()) {
+  const enc = new TextEncoder();
+  const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1);
+  const dosDate = ((date.getFullYear() - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  const chunks = [];
+  const central = [];
+  let offset = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name);
+    const crc = crc32(f.data);
+    const header = (sig, extra) => {
+      const h = new DataView(new ArrayBuffer(extra ? 46 : 30));
+      let p = 0;
+      const u16 = (v) => { h.setUint16(p, v, true); p += 2; };
+      const u32 = (v) => { h.setUint32(p, v, true); p += 4; };
+      u32(sig);
+      if (extra) u16(20); // version made by
+      u16(20); u16(0x0800); u16(0); u16(dosTime); u16(dosDate); // version needed, UTF-8 names, stored
+      u32(crc); u32(f.data.length); u32(f.data.length); u16(name.length); u16(0);
+      if (extra) { u16(0); u16(0); u16(0); u32(0); u32(offset); }
+      return new Uint8Array(h.buffer);
+    };
+    const local = header(0x04034b50, false);
+    chunks.push(local, name, f.data);
+    central.push(header(0x02014b50, true), name);
+    offset += local.length + name.length + f.data.length;
+  }
+  const centralSize = central.reduce((n, c) => n + c.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, files.length, true);
+  end.setUint16(10, files.length, true);
+  end.setUint32(12, centralSize, true);
+  end.setUint32(16, offset, true);
+  return new Blob([...chunks, ...central, new Uint8Array(end.buffer)], { type: 'application/zip' });
+}
+
+const fileSlug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+const mb = (bytes) => `${(bytes / 1e6).toFixed(1)} MB`;
+
+function clearExport() {
+  for (const p of exportParts) URL.revokeObjectURL(p.url);
+  exportParts = [];
+  $('scanlog-export-panel').hidden = true;
+  $('scanlog-export-panel').innerHTML = '';
+}
+
+/** Packs the chosen scans into ZIP parts (each image + a scans.json describing it) and shows Share / Download. */
+async function prepareExport(onlyProblems) {
+  clearExport();
+  const panel = $('scanlog-export-panel');
+  panel.hidden = false;
+  panel.innerHTML = '<p class="status">Preparing…</p>';
+
+  const entries = (await withScanStore('readonly', (s) => s.getAll()))
+    .filter((e) => !onlyProblems || scanProblems(e).length);
+  if (!entries.length) {
+    panel.innerHTML = `<p class="status">${onlyProblems ? 'No problem scans to export.' : 'No saved scans yet.'}</p>`;
+    return;
+  }
+
+  const enc = new TextEncoder();
+  const items = await Promise.all(entries.map(async (e) => {
+    const imageName = e.image ? `scan-${e.id}-${fileSlug(e.hero)}.jpg` : null;
+    const { image, ...rest } = e;
+    const c = scanCorrections(e);
+    const meta = { ...rest, image: imageName, problems: scanProblems(e), missed: c?.missed ?? null, wrong: c?.wrong ?? null, enhancedFixed: c?.enhanced ?? null };
+    const bytes = image ? new Uint8Array(await image.arrayBuffer()) : null;
+    return { meta, imageName, bytes, size: (bytes?.length ?? 0) + enc.encode(JSON.stringify(meta)).length + 200 };
+  }));
+
+  // Group into parts that each fit one Discord upload.
+  const groups = [];
+  let cur = [];
+  let size = 0;
+  for (const it of items) {
+    if (cur.length && (size + it.size > EXPORT_PART_BYTES || cur.length >= EXPORT_PART_IMAGES)) {
+      groups.push(cur);
+      cur = [];
+      size = 0;
+    }
+    cur.push(it);
+    size += it.size;
+  }
+  groups.push(cur);
+
   const d = new Date();
   const pad = (n) => String(n).padStart(2, '0');
-  a.download = `brawl-scans-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.json`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+  const base = `brawl-scans-${stamp}${onlyProblems ? '-problems' : ''}`;
+  exportParts = groups.map((g, i) => {
+    const suffix = groups.length > 1 ? `-part${i + 1}of${groups.length}` : '';
+    const json = JSON.stringify({
+      app: 'brawl-draft-advisor', exported: d.toISOString(), onlyProblems, part: i + 1, parts: groups.length, scans: g.map((it) => it.meta),
+    }, null, 1);
+    const jsonBytes = enc.encode(json);
+    const images = g.filter((it) => it.bytes);
+    const zip = new File([makeZip([{ name: 'scans.json', data: jsonBytes }, ...images.map((it) => ({ name: it.imageName, data: it.bytes }))], d)],
+      `${base}${suffix}.zip`, { type: 'application/zip' });
+    // Chrome on Android can't share .zip or .json files, so the share sheet falls back to the
+    // images plus the same scans.json as a .txt file.
+    const loose = [
+      new File([jsonBytes], `${base}${suffix}.txt`, { type: 'text/plain' }),
+      ...images.map((it) => new File([it.bytes], it.imageName, { type: 'image/jpeg' })),
+    ];
+    return { zip, loose, url: URL.createObjectURL(zip) };
+  });
+  renderExportPanel(entries.length);
+}
+
+const canShareFiles = (files) => { try { return !!navigator.canShare?.({ files }); } catch { return false; } };
+const shareFilesFor = (p) => (canShareFiles([p.zip]) ? [p.zip] : canShareFiles(p.loose) ? p.loose : null);
+
+function renderExportPanel(scanCount) {
+  const total = exportParts.reduce((n, p) => n + p.zip.size, 0);
+  const many = exportParts.length > 1;
+  $('scanlog-export-panel').innerHTML = `
+    <p class="export-sum">Ready: ${scanCount} scan${scanCount === 1 ? '' : 's'} · ${mb(total)}${many ? ` in ${exportParts.length} parts, each small enough for one Discord message` : ''}.</p>
+    ${exportParts.map((p, i) => `
+      <div class="export-part">
+        <span class="export-name">${esc(p.zip.name)} · ${mb(p.zip.size)}</span>
+        ${shareFilesFor(p) ? `<button data-share="${i}">Share</button>` : ''}
+        <a class="btn" href="${p.url}" download="${esc(p.zip.name)}">Download</a>
+      </div>`).join('')}
+    <p class="hint">Share sends to Discord, Google Drive, Quick Share, email… If a part shares as loose images plus a .txt, send them all together.</p>`;
+}
+
+async function sharePart(i) {
+  const p = exportParts[i];
+  const files = p && shareFilesFor(p);
+  if (!files) return;
+  try {
+    await navigator.share({ files, title: p.zip.name });
+  } catch (err) {
+    if (err.name !== 'AbortError') alert(`Couldn't share (${err.message}). Use Download instead.`);
+  }
 }
 
 async function deleteScanLog(id) {
@@ -1953,12 +2134,20 @@ async function init() {
     if (ev.target.closest('[data-action="missing"]')) return toggleMissingFlag();
     const flag = ev.target.closest('[data-wrong]');
     if (flag) return toggleWrongFlag(flag.dataset.wrong);
+    const enh = ev.target.closest('[data-enh]');
+    if (enh) return toggleEnhanced(enh.dataset.enh);
     const offer = ev.target.closest('.offer-main');
     if (offer) toggleOffer(offer.dataset.key);
   });
   $('scanlog-btn').addEventListener('click', openScanLog);
   $('scanlog-close').addEventListener('click', closeScanLog);
-  $('scanlog-export').addEventListener('click', () => exportScanLog().catch((err) => alert(`Export failed: ${err.message}`)));
+  const exportFailed = (err) => { $('scanlog-export-panel').innerHTML = `<p class="status error">Export failed: ${esc(err.message)}</p>`; };
+  $('scanlog-export-problems').addEventListener('click', () => prepareExport(true).catch(exportFailed));
+  $('scanlog-export').addEventListener('click', () => prepareExport(false).catch(exportFailed));
+  $('scanlog-export-panel').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('[data-share]');
+    if (btn) sharePart(Number(btn.dataset.share));
+  });
   $('scanlog-clear').addEventListener('click', () => {
     if (confirm('Delete all saved scans on this device?')) deleteScanLog().catch(() => {});
   });

@@ -411,6 +411,8 @@ kbd {
 .flag-btn:hover { color: var(--text); border-color: var(--g-avoid); }
 .flag-btn.on { color: #fff; background: var(--g-avoid); border-color: var(--g-avoid); }
 .scan-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.enh-btn:hover { border-color: #e9a8f0; }
+.enh-btn.on { color: #111; background: linear-gradient(90deg, #f3d27a, #e9a8f0); border-color: transparent; font-weight: 700; }
 
 /* Imbue target */
 .imbue-chip {
@@ -528,6 +530,23 @@ kbd {
 .log-meta { color: var(--muted); font-size: 12px; margin-bottom: 2px; }
 .log-body pre { white-space: pre-wrap; word-break: break-word; font-size: 11px; color: var(--muted); margin: 4px 0; }
 .log-actions { display: flex; gap: 6px; margin-top: 6px; }
+.scanlog-head button:disabled { opacity: 0.5; cursor: default; }
+.export-panel { margin: 8px 0 12px; padding: 10px 12px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; }
+.export-sum { margin: 0 0 6px; }
+.export-part { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 4px 0; }
+.export-name { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; font-size: 13px; color: var(--muted); }
+.export-part button, .export-part .btn {
+  padding: 5px 12px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+  text-decoration: none;
+  cursor: pointer;
+}
+.export-panel .hint { margin: 6px 0 0; }
 @media (max-width: 640px) {
   .log-entry { grid-template-columns: 1fr; }
   .log-thumb { width: 100%; height: 140px; }
