@@ -161,7 +161,7 @@ function loadPrefs() {
       if (el && [...el.options].some((o) => o.value === v)) el.value = v;
     }
     const ui = JSON.parse(localStorage.getItem(UI_KEY) || '{}');
-    if (ui.itemView === 'board' || ui.itemView === 'list') state.itemView = ui.itemView;
+    if (VIEWS.includes(ui.itemView)) state.itemView = ui.itemView;
     if (ui.boardTier === 'all' || Number.isInteger(ui.boardTier)) state.boardTier = ui.boardTier;
     if (ui.minGrade in GRADE_FILTERS) state.minGrade = ui.minGrade;
     if (typeof ui.saveScans === 'boolean') state.saveScans = ui.saveScans;
@@ -574,13 +574,26 @@ function boardTierList() {
 
 const itemImage = (item) => item.shop_image_webp || item.image_webp || item.image || '';
 
+const VIEWS = ['board', 'list', 'abilities'];
+
 function renderItems() {
-  const board = state.itemView === 'board';
-  $('board-view').hidden = !board;
-  $('list-view').hidden = board;
-  document.querySelectorAll('.view-tabs button').forEach((b) => b.classList.toggle('active', b.dataset.view === state.itemView));
-  if (board) renderBoard();
-  else renderTiers();
+  const view = state.itemView;
+  $('board-view').hidden = view !== 'board';
+  $('list-view').hidden = view !== 'list';
+  $('ability-view').hidden = view !== 'abilities';
+  $('legend').hidden = view === 'abilities';
+  document.querySelectorAll('.view-tabs button').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
+  if (view === 'board') renderBoard();
+  else if (view === 'list') renderTiers();
+}
+
+/** Switches tabs and brings the tabs to the top of the screen, so a long board doesn't leave you scrolled past the new view. */
+function setView(view) {
+  state.itemView = view;
+  savePrefs();
+  renderItems();
+  const bar = $('item-bar');
+  if (bar.getBoundingClientRect().top < 0) bar.scrollIntoView({ block: 'start' });
 }
 
 // ---------- rendering: draft board ----------
@@ -706,7 +719,7 @@ function renderTray() {
 
   let rank = 0;
   $('tray').innerHTML = `
-    <div class="verdict">${verdict}<button class="clear" data-action="clear">Clear (Esc)</button></div>
+    <div class="verdict">${verdict}<span class="verdict-btns"><button class="clear" data-action="abilities" title="Show the ability upgrade order">Abilities</button><button class="clear" data-action="clear">Clear (Esc)</button></span></div>
     ${scanLine}
     ${mixedNote}
     <div class="offer-list">${[...offered, ...all.filter(isWrong)].map((o) => `
@@ -2088,7 +2101,11 @@ async function init() {
     if (card) location.hash = `hero=${card.dataset.hero}`;
   });
   $('back').addEventListener('click', () => { location.hash = ''; });
-  $('item-search').addEventListener('input', () => state.view && renderItems());
+  $('item-search').addEventListener('input', () => {
+    if (!state.view) return;
+    if (state.itemView === 'abilities') state.itemView = 'board'; // typing an item name means drafting again
+    renderItems();
+  });
   $('item-search').addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter' && state.view && state.itemView === 'board') {
       const pool = state.view.items.entries;
@@ -2109,10 +2126,7 @@ async function init() {
   });
   document.querySelector('.view-tabs').addEventListener('click', (ev) => {
     const btn = ev.target.closest('[data-view]');
-    if (!btn || !state.view) return;
-    state.itemView = btn.dataset.view;
-    savePrefs();
-    renderItems();
+    if (btn && state.view) setView(btn.dataset.view);
   });
   $('tier-tabs').addEventListener('click', (ev) => {
     const btn = ev.target.closest('[data-tier]');
@@ -2131,6 +2145,7 @@ async function init() {
   });
   $('tray').addEventListener('click', (ev) => {
     if (ev.target.closest('[data-action="clear"]')) return clearOffer();
+    if (ev.target.closest('[data-action="abilities"]')) return setView('abilities');
     if (ev.target.closest('[data-action="missing"]')) return toggleMissingFlag();
     const flag = ev.target.closest('[data-wrong]');
     if (flag) return toggleWrongFlag(flag.dataset.wrong);

@@ -47,15 +47,15 @@
     <section id="hero-view" hidden>
       <div id="hero-head" class="hero-head"></div>
 
-      <div class="item-bar">
-        <h2>Items</h2>
+      <div id="item-bar" class="item-bar">
         <div class="view-tabs" role="tablist">
           <button data-view="board" role="tab">Draft board</button>
           <button data-view="list" role="tab">Full list</button>
+          <button data-view="abilities" role="tab">Abilities</button>
         </div>
       </div>
 
-      <div class="legend">
+      <div id="legend" class="legend">
         <span class="grade g-best">Best</span>
         <span class="grade g-good">Good</span>
         <span class="grade g-mid">Mid</span>
@@ -87,12 +87,14 @@
         <div id="tiers" class="tiers"></div>
       </div>
 
-      <h2>Ability order</h2>
-      <div class="ability-controls">
-        <label><input type="radio" name="ab-mode" value="wr" checked> Highest win rate path</label>
-        <label><input type="radio" name="ab-mode" value="pop"> Most popular path</label>
+      <div id="ability-view" hidden>
+        <h2>Ability order</h2>
+        <div class="ability-controls">
+          <label><input type="radio" name="ab-mode" value="wr" checked> Highest win rate path</label>
+          <label><input type="radio" name="ab-mode" value="pop"> Most popular path</label>
+        </div>
+        <div id="abilities"></div>
       </div>
-      <div id="abilities"></div>
 
       <details class="about">
         <summary>How this works</summary>
