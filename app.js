@@ -51,6 +51,9 @@ const SCAN_MIN_SIMILARITY_LONG_LINE = 0.9; // for a name found inside a line ove
 const SCAN_MIN_WORD_SHARE = 0.4; // a word naming an item on its own must be this share of the line's letters
 // Two fragments joined into one chunk can make letter soup, so they need a closer match.
 const SCAN_MIN_SIMILARITY_JOINED = 0.85;
+const SCAN_SURE_SIMILARITY = 0.9; // a match this close is taken even if another item is nearly as close
+const SCAN_AMBIGUOUS_GAP = 0.05; // two looser matches this close together are a coin flip, so neither counts
+const SCAN_MIN_PREFIX_SHARE = 0.55; // a cut-off name must keep at least this share of its letters
 // Draft screen layout, measured on real phone photos: where each name sits relative to the
 // "Re-Roll Remaining" line under the re-roll button, in units of that line's standard width.
 const SCAN_ANCHOR_TEXT = '1 Re-Roll Remaining';
@@ -58,7 +61,14 @@ const SCAN_NAME_SLOTS = [{ x: -2.72, y: -0.21 }, { x: 0.04, y: -1.77 }, { x: 2.7
 // Each name is cropped this size (same units) and enlarged to this many pixels tall for reading.
 const SCAN_CROP = { width: 2.6, height: 0.5, textPx: 110 };
 // Reads tried for a name position, in order: crop offset (layout units) and page-segmentation mode.
-const SCAN_SLOT_TRIES = [{ dy: 0, psm: '7' }, { dy: 0, psm: '6' }, { dy: 0.2, psm: '7' }, { dy: -0.2, psm: '7' }];
+// level: keep only pixels at least this bright (after contrast stretch) as black-on-white. Item names are
+// the brightest thing on a card, so this drops the glowing rings that otherwise derail the reader; no one
+// level suits every exposure, so a few are tried. threshold: as in SCAN_PASSES.
+const SCAN_SLOT_TRIES = [
+  { dy: 0, psm: '7', level: 225 }, { dy: 0, psm: '7' }, { dy: 0, psm: '7', level: 200 }, { dy: 0, psm: '7', level: 245 },
+  { dy: 0, psm: '6' }, { dy: 0.2, psm: '7', level: 225 }, { dy: -0.2, psm: '7', level: 225 },
+  { dy: 0, psm: '7', threshold: '1' }, { dy: 0.2, psm: '7', threshold: '1' },
+];
 // The strip checked for an "ENHANCED" label under a name is enlarged to this many pixels tall.
 const SCAN_LABEL_PX = 70;
 // Whole-photo matches whose text is less than this share of two other matched names' are dropped.
@@ -1032,7 +1042,7 @@ function renderHero() {
 
 // ---------- camera scan ----------
 
-const scan = { stream: null, workerPromise: null, readerReady: false, busy: false, psm: '11' };
+const scan = { stream: null, workerPromise: null, readerReady: false, busy: false, psm: '11', threshold: '0' };
 
 function loadScript(src) {
   return new Promise((resolve, reject) => {
@@ -1111,9 +1121,13 @@ function closeScanner() {
   $('scan-video').srcObject = null;
 }
 
+// threshold: Tesseract's thresholding_method. '0' (one black/white cutoff for the whole photo) reads
+// best when the screen fills the frame; '1' (a cutoff per tile) rescues photos where dark surroundings
+// (desk, wall) drag the single cutoff so low that the screen and its text both turn white.
 const SCAN_PASSES = [
-  { side: SCAN_MAX_SIDE, maxScale: 1, stretch: false },
-  { side: SCAN_SECOND_PASS_SIDE, maxScale: 2, stretch: true },
+  { side: SCAN_MAX_SIDE, maxScale: 1, stretch: false, threshold: '0' },
+  { side: SCAN_SECOND_PASS_SIDE, maxScale: 2, stretch: true, threshold: '0' },
+  { side: SCAN_MAX_SIDE, maxScale: 1, stretch: false, threshold: '1' },
 ];
 const scanScale = (width, height, pass) => Math.min(pass.maxScale, pass.side / Math.max(width, height));
 
@@ -1143,6 +1157,16 @@ function greyCanvas(source, region, scale, stretch) {
   if (stretch && hi > lo) {
     for (let i = 0; i < px.length; i += 4) px[i] = px[i + 1] = px[i + 2] = ((px[i] - lo) * 255) / (hi - lo);
   }
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
+/** Turns a greyscale canvas black-on-white, keeping as text only the pixels at least `level` bright. */
+function brightOnly(canvas, level) {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const px = img.data;
+  for (let i = 0; i < px.length; i += 4) px[i] = px[i + 1] = px[i + 2] = px[i] >= level ? 0 : 255;
   ctx.putImageData(img, 0, 0);
   return canvas;
 }
@@ -1270,10 +1294,11 @@ async function scanImageFile(file) {
 }
 
 /** OCR lines with boxes in source pixels; the canvas shows `region` of the source at `scale`. */
-async function ocrLines(worker, canvas, scale, psm = '11', region = { x: 0, y: 0 }) {
-  if (scan.psm !== psm) {
-    await worker.setParameters({ tessedit_pageseg_mode: psm });
+async function ocrLines(worker, canvas, scale, psm = '11', region = { x: 0, y: 0 }, threshold = '0') {
+  if (scan.psm !== psm || scan.threshold !== threshold) {
+    await worker.setParameters({ tessedit_pageseg_mode: psm, thresholding_method: threshold });
     scan.psm = psm;
+    scan.threshold = threshold;
   }
   const { data } = await worker.recognize(canvas, {}, { text: true, blocks: true });
   return (data.blocks || [])
@@ -1342,7 +1367,7 @@ async function readNameSlots(worker, source, width, height, anchor, found, log) 
     if (found.some((f) => Math.abs(f.at.x - cx) < 1.2 * anchor.unit && Math.abs(f.at.y - cy) < 0.5 * anchor.unit)) continue;
     // Photos taken at an angle can put a name a little above or below its expected spot, cutting it off
     // at the crop's edge; a miss is retried with the crop moved down, then up.
-    for (const { dy, psm } of SCAN_SLOT_TRIES) {
+    for (const { dy, psm, level, threshold = '0' } of SCAN_SLOT_TRIES) {
       const y = cy + dy * anchor.unit;
       const x0 = Math.max(0, cx - (SCAN_CROP.width * anchor.unit) / 2);
       const y0 = Math.max(0, y - (SCAN_CROP.height * anchor.unit) / 2);
@@ -1351,9 +1376,11 @@ async function readNameSlots(worker, source, width, height, anchor, found, log) 
       if (x1 - x0 < 20 || y1 - y0 < 10) continue;
       const region = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
       const scale = Math.min(4, Math.max(1, SCAN_CROP.textPx / region.h));
-      const text = (await ocrLines(worker, greyCanvas(source, region, scale, true), scale, psm, region)).map((l) => l.text).join(' ');
+      const canvas = greyCanvas(source, region, scale, true);
+      if (level) brightOnly(canvas, level);
+      const text = (await ocrLines(worker, canvas, scale, psm, region, threshold)).map((l) => l.text).join(' ');
       const m = bestItemFor(text, false);
-      log.push({ slot: i, psm, dy, text, item: m?.e.item.name ?? null });
+      log.push({ slot: i, psm, dy, level, threshold, text, item: m?.e.item.name ?? null });
       if (m) {
         const nameBox = { x0: cx - 0.8 * anchor.unit, y0: y - 0.12 * anchor.unit, x1: cx + 0.8 * anchor.unit, y1: y + 0.12 * anchor.unit };
         items.push({ e: m.e, sim: m.sim, at: { x: cx, y }, box: nameBox, enhanced: isEnhancedLabel(text) && !!m.e.enh });
@@ -1434,29 +1461,33 @@ async function runScan(source, width, height, origin, { final = true } = {}) {
     setScanStatus(scan.readerReady ? 'Reading…' : 'Preparing the text reader, then reading…');
     const worker = await ocrWorker();
     const whole = { x: 0, y: 0, w: width, h: height };
-    const [first, second] = SCAN_PASSES;
     const slotReads = [];
+    const passLines = [];
+    let lines = [];
+    let found = [];
+    let anchor = null;
+    let slotsRead = false;
 
-    const s1 = scanScale(width, height, first);
-    const firstLines = await ocrLines(worker, greyCanvas(source, whole, s1, first.stretch), s1);
-    let lines = firstLines;
-    let found = matchOfferLines(lines);
-    let anchor = findLayoutAnchor(lines) || inferAnchorFromItems(found);
-    if (found.length < SCAN_EXPECTED && anchor) {
-      found = mergeFound(found, await readNameSlots(worker, source, width, height, anchor, found, slotReads));
-    }
-
-    let secondLines = null;
-    if (found.length < SCAN_EXPECTED) {
-      setScanStatus(`Found ${found.length} — taking a closer look…`);
-      const s2 = scanScale(width, height, second);
-      secondLines = await ocrLines(worker, greyCanvas(source, whole, s2, second.stretch), s2);
-      lines = firstLines.concat(secondLines);
+    // Each pass reads the whole photo; later passes only run while items are still missing. As soon as
+    // the layout is known (from "Re-Roll Remaining", or two names), the missing name positions are read.
+    for (const [i, pass] of SCAN_PASSES.entries()) {
+      if (i > 0) {
+        if (found.length >= SCAN_EXPECTED) break;
+        setScanStatus(`Found ${found.length} — taking a closer look…`);
+      }
+      const s = scanScale(width, height, pass);
+      const read = await ocrLines(worker, greyCanvas(source, whole, s, pass.stretch), s, '11', whole, pass.threshold);
+      passLines.push(read);
+      lines = lines.concat(read);
       found = mergeFound(found, matchOfferLines(lines));
-      if (found.length < SCAN_EXPECTED && !anchor && (anchor = findLayoutAnchor(secondLines) || inferAnchorFromItems(found))) {
+      anchor ||= findLayoutAnchor(read) || inferAnchorFromItems(found);
+      if (found.length < SCAN_EXPECTED && anchor && !slotsRead) {
+        slotsRead = true;
         found = mergeFound(found, await readNameSlots(worker, source, width, height, anchor, found, slotReads));
       }
     }
+    const [firstLines, ...laterLines] = passLines;
+    const secondLines = laterLines.length ? laterLines.flat() : null;
     markEnhanced(found, lines);
     await readEnhancedLabels(worker, source, width, height, found, slotReads);
     if (found.length > SCAN_EXPECTED) found = mostLikelyOffer(found, anchor);
@@ -1918,16 +1949,35 @@ function bestItemFor(text, joined) {
   const t = lettersOnly(text);
   let full = null;
   if (t.length >= 4) {
+    // In a line much longer than the name (a sentence, e.g. "Spirit Damage Returned" in a tooltip), a
+    // loose match is usually chance, so only a near-exact one counts there.
+    const minSim = (m) => (t.length > 2 * lettersOnly(m.e.item.name).length ? SCAN_MIN_SIMILARITY_LONG_LINE
+      : m.e.item.name.length <= 8 ? SCAN_MIN_SIMILARITY_SHORT : SCAN_MIN_SIMILARITY);
+    let runnerUp = null;
     for (const c of candidates) {
       if (t.length < c.letters.length * 0.6) continue;
       const sim = 1 - substringDistance(c.letters, t) / c.letters.length;
       const score = sim + 0.15 * Math.min(1, c.letters.length / t.length);
-      if (!full || score > full.score) full = { e: c.e, sim, score };
+      const m = { e: c.e, sim, score };
+      if (!full || score > full.score) [runnerUp, full] = [full, m];
+      else if (!runnerUp || score > runnerUp.score) runnerUp = m;
     }
-    // In a line much longer than the name (a sentence, e.g. "Spirit Damage Returned" in a tooltip), a
-    // loose match is usually chance, so only a near-exact one counts there.
-    const long = full && t.length > 2 * lettersOnly(full.e.item.name).length;
-    if (full && full.sim < (long ? SCAN_MIN_SIMILARITY_LONG_LINE : full.e.item.name.length <= 8 ? SCAN_MIN_SIMILARITY_SHORT : SCAN_MIN_SIMILARITY)) full = null;
+    if (full && full.sim < minSim(full)) full = null;
+    // A loose read that fits two items about equally ("Mystic feet": Mystic Shot or Mystic Reverb?)
+    // names neither; leaving the slot empty lets the single-line read of that name settle it.
+    if (full && full.sim < SCAN_SURE_SIMILARITY && runnerUp && runnerUp.sim >= minSim(runnerUp) && runnerUp.sim >= full.sim - SCAN_AMBIGUOUS_GAP) full = null;
+
+    // A name cut off at the end ("Mystic Reged") is the start of the item, not a loose match of a
+    // shorter one ("Mystic Reverb"). Counts only when it fits the start of exactly one item closely.
+    // ("Escalating" starts two items, so it names neither, however much of either it covers.)
+    const starts = [];
+    for (const c of candidates) {
+      if (t.length < 8 || t.length >= c.letters.length) continue;
+      const sim = 1 - editDistance(t, c.letters.slice(0, t.length)) / t.length;
+      if (sim >= SCAN_SURE_SIMILARITY) starts.push({ e: c.e, sim, share: t.length / c.letters.length });
+    }
+    const start = starts.length === 1 && starts[0].share >= SCAN_MIN_PREFIX_SHARE ? starts[0] : null;
+    if (start && (!full || (full.sim < SCAN_SURE_SIMILARITY && start.sim > full.sim))) full = { e: start.e, sim: start.sim };
   }
   let word = null;
   for (const w of text.toLowerCase().split(/\s+/).map(lettersOnly)) {
